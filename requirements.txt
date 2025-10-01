@@ -1,0 +1,5 @@
+telethon
+breez-sdk-spark
+mnemonic
+keyvalue-sqlite
+python-dotenv
