@@ -115,7 +115,7 @@ This bot is provided as-is for educational and experimental purposes. Use at you
 ## 🙏 Acknowledgments
 
 - [Breez](https://breez.technology/) for the amazing Spark SDK
-- [spark](https://www.spark.mony/) for Lightning infrastructure
+- [spark](https://spark.money/) for Lightning infrastructure
 - Telegram for the Bot API
 
 ## Support
