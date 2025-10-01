@@ -91,7 +91,7 @@ When you send /start, you’ll see the main menu with options:
 ## 🛠️ Tech Stack
 
 - [Telethon](https://github.com/LonamiWebs/Telethon) - Telegram MTProto API client
-- [Breez SDK Spark](https://github.com/breez/breez-sdk) - Lightning Network payments
+- [Breez SDK Spark](https://github.com/breez/spark-sdk) - Lightning Network payments
 - [KeyValue SQLite](https://github.com/ccbrown/keyvalue-sqlite) - Simple key-value database
 - [Python Mnemonic](https://github.com/trezor/python-mnemonic) - BIP39 mnemonic generation
 
