@@ -78,25 +78,6 @@ When you send /start, you’ll see the main menu with options:
   - ⚡ Change Lightning Address - Customize your address
 - 💝 Donate - Support the bot developer
 
-## 🏗️ Architecture
-┌─────────────────────┐
-│  Telegram Bot API   │
-└──────────┬──────────┘
-           │
-┌──────────▼──────────┐
-│   Telethon Client   │
-└──────────┬──────────┘
-           │
-┌──────────▼──────────┐
-│    Spark SDK        │
-│  (Breez SDK Spark)  │
-└──────────┬──────────┘
-           │
-┌──────────▼──────────┐
-│  Bitcoin Lightning  │
-│      Network        │
-└─────────────────────┘
-
 ## 🔒 Security
 
 - Only mnemonic seeds are stored
@@ -135,7 +116,7 @@ This bot is provided as-is for educational and experimental purposes. Use at you
 - [spark](https://www.spark.mony/) for Lightning infrastructure
 - Telegram for the Bot API
 
-## 📞 Support
+## Support
 - Donate: musa@breez.tips
 -----
 Made with ⚡ and Bitcoin
