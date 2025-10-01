@@ -1,6 +1,6 @@
 # ⚡ Telegram Bitcoin Lightning Wallet Bot
 
-A self-custodial Bitcoin Lightning wallet bot for Telegram, enabling instant peer-to-peer payments, zaps, and donations with zero-fee internal transfers using Breez Spark SDK.
+Bitcoin Lightning wallet bot for Telegram, enabling instant peer-to-peer payments, zaps, and donations with zero-fee internal transfers using Breez Spark SDK.
 
 [@Zap_lnbot](https://t.me/Zap_lnbot)
 
