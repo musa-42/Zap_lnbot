@@ -477,8 +477,6 @@ Click "History" to view your recent transactions
 • Check fees before confirming
 • Always backup before receiving large amounts
 
-**Need more help?**
-Contact: @musasoftorg
 """
     
     await event.edit(
