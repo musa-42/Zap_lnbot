@@ -8,11 +8,15 @@ from random import choice
 from string import ascii_lowercase
 import os
 from dotenv import load_dotenv
+from datetime import datetime
 
 load_dotenv()
 
-# Uncomment for debugging
-# logging.basicConfig(level=logging.DEBUG)
+# Enable logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 mnemo = Mnemonic("english")
 
@@ -20,7 +24,7 @@ mnemo = Mnemonic("english")
 DB_PATH = './db-bot.sqlite'
 db = KeyValueSqlite(DB_PATH, 'table-name')
 
-# Telegram API credentials (set these in environment variables)
+# Telegram API credentials
 api_id = os.getenv('TELEGRAM_API_ID')
 api_hash = os.getenv('TELEGRAM_API_HASH')
 bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -39,6 +43,149 @@ client = TelegramClient('bot', api_id, api_hash).start(bot_token=bot_token)
 # User state tracking
 user_steps = {}
 user_data = {}
+
+# Payment notification tracking (timestamp-based)
+user_last_payment_time = {}  # {user_id: last_payment_timestamp}
+user_last_activity = {}  # {user_id: last_activity_timestamp}
+
+
+async def mark_user_active(user_id):
+    """Mark user as active"""
+    user_last_activity[user_id] = datetime.now()
+    
+    # Initialize payment tracking if needed
+    if user_id not in user_last_payment_time:
+        asyncio.create_task(check_new_payments(user_id))
+
+
+async def check_new_payments(user_id):
+    """Check for new RECEIVED payments via history - timestamp based"""
+    try:
+        # Get recent payments (limit 10 to catch multiple new ones)
+        payments = await get_payment_history(user_id, limit=10)
+        
+        if not payments:
+            if user_id not in user_last_payment_time:
+                user_last_payment_time[user_id] = 0
+            return
+        
+        # Get last checked timestamp
+        last_checked_time = user_last_payment_time.get(user_id, 0)
+        
+        # Find all new RECEIVED payments since last check
+        new_received_payments = []
+        latest_timestamp = last_checked_time
+        
+        for payment in payments:
+            payment_timestamp = getattr(payment, 'timestamp', 0)
+            payment_type = getattr(payment, 'payment_type', None)
+            
+            # Update latest timestamp
+            if payment_timestamp > latest_timestamp:
+                latest_timestamp = payment_timestamp
+            
+            # Check if it's a new RECEIVED payment
+            if payment_timestamp > last_checked_time:
+                # Check if it's RECEIVE type (PaymentType.RECEIVE)
+                if payment_type == PaymentType.RECEIVE:
+                    new_received_payments.append(payment)
+        
+        # Update last checked timestamp
+        user_last_payment_time[user_id] = latest_timestamp
+        
+        # If this is first check (initialization), don't notify
+        if last_checked_time == 0:
+            return
+        
+        # Notify user about each new received payment
+        for payment in reversed(new_received_payments):  # Oldest first
+            amount = getattr(payment, 'amount_sats', getattr(payment, 'amount', 0))
+            payment_id = getattr(payment, 'id', 'N/A')
+            timestamp = getattr(payment, 'timestamp', 0)
+            
+            # Format time - smart detection for seconds vs milliseconds
+            if timestamp:
+                try:
+                    # If timestamp > 1e12, it's in milliseconds
+                    if timestamp > 1000000000000:
+                        dt = datetime.fromtimestamp(timestamp / 1000)
+                    else:
+                        dt = datetime.fromtimestamp(timestamp)
+                    time_str = dt.strftime('%Y-%m-%d %H:%M')
+                except Exception as e:
+                    logging.debug(f"Timestamp conversion error: {e}, timestamp={timestamp}")
+                    time_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+            else:
+                time_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+            
+            await client.send_message(
+                user_id,
+                f"🎉 **Payment Received!**\n\n"
+                f"💰 Amount: {amount} sats\n"
+                f"⏰ {time_str}\n"
+                f"🆔 ID: `{payment_id}`\n\n"
+                f"Use /start to see your updated balance!"
+            )
+            logging.info(f"💰 [{user_id}] Notified: {amount} sats received at {time_str}")
+        
+    except Exception as error:
+        logging.debug(f"Check error [{user_id}]: {error}")
+
+
+async def monitor_active_users():
+    """Background polling - checks active users every 30s"""
+    batch_size = 50
+    check_interval = 10
+    inactive_threshold = 86400  # 24 hours
+    
+    while True:
+        try:
+            await asyncio.sleep(check_interval)
+            
+            current_time = datetime.now()
+            active_users = []
+            inactive_users = []
+            
+            for user_id in list(user_last_payment_time.keys()):
+                last_activity = user_last_activity.get(user_id)
+                
+                if last_activity:
+                    time_diff = (current_time - last_activity).total_seconds()
+                    
+                    if time_diff < inactive_threshold:
+                        active_users.append(user_id)
+                    else:
+                        inactive_users.append(user_id)
+                else:
+                    inactive_users.append(user_id)
+            
+            for user_id in inactive_users:
+                if user_id in user_last_payment_time:
+                    del user_last_payment_time[user_id]
+                if user_id in user_last_activity:
+                    del user_last_activity[user_id]
+            
+            if inactive_users:
+                logging.info(f"🧹 Cleaned up {len(inactive_users)} inactive users")
+            
+            if not active_users:
+                continue
+            
+            users_batch = active_users[:batch_size]
+            
+            for user_id in users_batch:
+                try:
+                    await check_new_payments(user_id)
+                    await asyncio.sleep(0.2)
+                except Exception as e:
+                    logging.debug(f"Error checking user {user_id}: {e}")
+            
+            if users_batch:
+                logging.debug(f"📊 Checked {len(users_batch)}/{len(active_users)} active users")
+        
+        except Exception as error:
+            logging.error(f"Monitor error: {error}")
+            await asyncio.sleep(60)
 
 
 async def get_balance(user_id):
@@ -60,7 +207,6 @@ async def init(user_id):
     if user_id not in users:
         words = mnemo.generate(strength=128)
         logging.info(f"New wallet created for user {user_id}")
-        print(f"Mnemonic: {words}")
         db.set_default(f'{user_id}', words)
         users.append(user_id)
         db.set(f'users', users)
@@ -90,6 +236,47 @@ async def create_invoice(user_id, amount_sats=None, description="Zap payment"):
         return payment_request
     except Exception as error:
         logging.error(f"Error creating invoice: {error}")
+        raise
+
+
+async def create_onchain_address(user_id):
+    """Create onchain Bitcoin address for receiving"""
+    try:
+        sdk = await get_wallet(user_id)
+        request = ReceivePaymentRequest(
+            payment_method=ReceivePaymentMethod.BITCOIN_ADDRESS()
+        )
+        response = await sdk.receive_payment(request=request)
+        
+        payment_request = response.payment_request
+        receive_fee_sats = response.fee_sats
+        
+        logging.debug(f"Onchain Address: {payment_request}")
+        logging.debug(f"Receive Fees: {receive_fee_sats} sats")
+        
+        return payment_request, receive_fee_sats
+    except Exception as error:
+        logging.error(f"Error creating onchain address: {error}")
+        raise
+
+
+async def get_payment_history(user_id, limit=20):
+    """Get payment history for a user"""
+    try:
+        sdk = await get_wallet(user_id)
+        response = await sdk.list_payments(request=ListPaymentsRequest())
+        payments = response.payments
+        
+        # Sort by timestamp (most recent first) and limit
+        sorted_payments = sorted(
+            payments, 
+            key=lambda p: getattr(p, 'timestamp', 0), 
+            reverse=True
+        )[:limit]
+        
+        return sorted_payments
+    except Exception as error:
+        logging.error(f"Error getting payment history: {error}")
         raise
 
 
@@ -129,7 +316,6 @@ async def prepare_payment(user_id, invoice, amount_sats=None):
         )
 
         prepare_response = await sdk.prepare_send_payment(request=request)
-        print(prepare_response)
         
         fee_sats = 0
         spark_fee = 0
@@ -200,7 +386,8 @@ def get_main_buttons():
     """Get main menu buttons"""
     return [
         [Button.inline("📤 Send", b"send"), Button.inline("📥 Receive", b"receive")],
-        [Button.inline("🔄 Refresh", b"refresh"), Button.inline("⚙️ Settings", b"settings")],
+        [Button.inline("📜 History", b"history"), Button.inline("🔄 Refresh", b"refresh")],
+        [Button.inline("⚙️ Settings", b"settings"), Button.inline("❓ Help", b"help")],
         [Button.inline("💝 Donate", b"donate")],
     ]
 
@@ -209,6 +396,10 @@ async def show_main_menu(event, edit=False):
     """Show main wallet menu"""
     user_id = event.sender_id
     await init(user_id)
+    
+    # Mark user as active for payment monitoring
+    await mark_user_active(user_id)
+    
     balance = await get_balance(user_id)
     
     message = f"""💳 **Your Wallet**
@@ -226,6 +417,196 @@ Choose an option:
         await event.message.edit(message, buttons=get_main_buttons())
     else:
         await event.respond(message, buttons=get_main_buttons())
+
+
+async def show_help_menu(event):
+    """Show help and guide for using the bot"""
+    help_text = """📖 **Bot Guide & Help**
+
+**🚀 Getting Started:**
+1. Use /start to open your wallet
+2. **⚠️ IMPORTANT: Backup your seed phrase in Settings!**
+3. Never share your seed phrase with anyone
+4. Start sending and receiving Bitcoin!
+
+**🔐 Backup Your Wallet (CRITICAL!):**
+• Go to Settings → Backup Seeds
+• Save your 12-word recovery phrase
+• Store it safely offline
+• **Without backup, you may lose your funds!**
+
+**📤 Sending Payments:**
+• Click "Send" button
+• Paste Lightning Invoice, Lightning Address, Bitcoin Address, or LNURL
+• Confirm the amount and fees
+• Done! ⚡
+
+**📥 Receiving Payments:**
+• Click "Receive" button
+• Choose Lightning or Onchain
+• Share your Lightning Address or Invoice
+• Get paid instantly!
+
+**⚡ Zap Command (Groups):**
+Use `/zap` command in groups to tip others:
+
+**Method 1: Reply to message**
+Reply to someone's message and type:
+`/zap 1000`
+
+**Method 2: Mention username**
+`/zap 1000 @username`
+
+**Examples:**
+• `/zap 500` - Send 500 sats to replied user
+• `/zap 2100 @alice` - Send 2100 sats to @alice
+• `/zap 21000` - Send 21000 sats (reply to message)
+
+**📜 Transaction History:**
+Click "History" to view your recent transactions
+
+**⚙️ Settings:**
+• Backup Seeds - Save your recovery phrase
+• Recovery Wallet - Restore from seed
+• Change Lightning Address - Customize your address
+
+**💡 Tips:**
+• Keep your seed phrase safe and private
+• Small amounts = Lightning (instant)
+• Large amounts = Onchain (secure)
+• Check fees before confirming
+• Always backup before receiving large amounts
+
+**Need more help?**
+Contact: @musasoftorg
+"""
+    
+    await event.edit(
+        help_text,
+        buttons=[[Button.inline("« Back to Menu", b"back_to_menu")]]
+    )
+
+
+async def show_transaction_history(event, user_id, page=0):
+    """Show transaction history with pagination"""
+    try:
+        await event.answer("📜 Loading history...")
+        
+        payments = await get_payment_history(user_id, limit=50)
+        
+        # Update last payment timestamp when viewing history
+        if payments and user_id in user_last_payment_time:
+            latest_timestamp = getattr(payments[0], 'timestamp', 0)
+            if latest_timestamp > 0:
+                user_last_payment_time[user_id] = latest_timestamp
+                logging.debug(f"Updated timestamp for user {user_id} from history view")
+        
+        if not payments:
+            await event.edit(
+                "📜 **Transaction History**\n\n"
+                "No transactions yet.\n\n"
+                "Start using your wallet to see transactions here!",
+                buttons=[[Button.inline("« Back to Menu", b"back_to_menu")]]
+            )
+            return
+        
+        # Pagination
+        items_per_page = 10
+        start_idx = page * items_per_page
+        end_idx = start_idx + items_per_page
+        page_payments = payments[start_idx:end_idx]
+        
+        history_text = f"📜 **Transaction History** (Page {page + 1})\n\n"
+        
+        for payment in page_payments:
+            # Get payment details
+            payment_type = getattr(payment, 'payment_type', 'Unknown')
+            amount = getattr(payment, 'amount_sats', getattr(payment, 'amount', 0))
+            timestamp = getattr(payment, 'timestamp', 0)
+            status = getattr(payment, 'status', 'Unknown')
+            
+            # Format timestamp - smart detection for seconds vs milliseconds
+            if timestamp:
+                try:
+                    # If timestamp > 1e12, it's in milliseconds
+                    if timestamp > 1000000000000:
+                        dt = datetime.fromtimestamp(timestamp / 1000)
+                    else:
+                        dt = datetime.fromtimestamp(timestamp)
+                    time_str = dt.strftime('%Y-%m-%d %H:%M')
+                except Exception as e:
+                    logging.debug(f"Timestamp conversion error: {e}, timestamp={timestamp}")
+                    time_str = 'Unknown'
+            else:
+                time_str = 'Unknown'
+            
+            # Determine if incoming or outgoing
+            is_incoming = False
+            if hasattr(payment, 'direction'):
+                direction = payment.direction
+                if direction == PaymentDirection.INCOMING:
+                    is_incoming = True
+                    icon = "📥"
+                    amount_str = f"+{amount}"
+                    direction_text = "Received"
+                else:
+                    icon = "📤"
+                    amount_str = f"-{amount}"
+                    direction_text = "Sent"
+            else:
+                # Fallback: check payment_type
+                icon = "💳"
+                amount_str = str(amount)
+                direction_text = "Payment"
+            
+            # Status emoji
+            status_str = str(status).lower()
+            if 'complete' in status_str or 'succeeded' in status_str:
+                status_icon = "✅"
+                status_text = "Complete"
+            elif 'pending' in status_str:
+                status_icon = "⏳"
+                status_text = "Pending"
+            elif 'failed' in status_str:
+                status_icon = "❌"
+                status_text = "Failed"
+            else:
+                status_icon = "⚪"
+                status_text = str(status)
+            
+            # Format payment type
+            type_str = str(payment_type).replace('PaymentType.', '')
+            
+            history_text += (
+                f"{icon} **{direction_text}** {status_icon}\n"
+                f"   💰 {amount_str} sats\n"
+                f"   📅 {time_str}\n"
+                f"   🏷️ {type_str}\n\n"
+            )
+        
+        # Pagination buttons
+        buttons = []
+        nav_buttons = []
+        
+        if page > 0:
+            nav_buttons.append(Button.inline("⬅️ Previous", f"history_page_{page - 1}".encode()))
+        
+        if end_idx < len(payments):
+            nav_buttons.append(Button.inline("Next ➡️", f"history_page_{page + 1}".encode()))
+        
+        if nav_buttons:
+            buttons.append(nav_buttons)
+        
+        buttons.append([Button.inline("« Back to Menu", b"back_to_menu")])
+        
+        await event.edit(history_text, buttons=buttons)
+    
+    except Exception as error:
+        await event.edit(
+            f"❌ Error loading history:\n{error}",
+            buttons=[[Button.inline("« Back to Menu", b"back_to_menu")]]
+        )
+        logging.error(f"Transaction history error: {error}")
 
 
 async def prepare_and_show_fee(event, user_id, invoice, amount):
@@ -275,7 +656,61 @@ async def prepare_and_show_fee(event, user_id, invoice, amount):
 @client.on(events.NewMessage(func=lambda e: e.is_private, pattern='/start'))
 async def start_command(event):
     """Handle /start command"""
+    # Start monitoring task on first user
+    if not hasattr(start_command, '_monitor_started'):
+        asyncio.create_task(monitor_active_users())
+        start_command._monitor_started = True
+        logging.info("🔔 Payment monitoring started")
+    
+    # Mark user as active
+    await mark_user_active(event.sender_id)
+    
     await show_main_menu(event)
+
+
+@client.on(events.NewMessage(func=lambda e: e.is_private, pattern='/debug'))
+async def debug_command(event):
+    """Debug command to check notification system status"""
+    user_id = event.sender_id
+    
+    # Check if user is being monitored
+    if user_id in user_last_payment_time:
+        last_payment_time = user_last_payment_time[user_id]
+        last_activity = user_last_activity.get(user_id)
+        activity_str = last_activity.strftime('%Y-%m-%d %H:%M:%S') if last_activity else 'Never'
+        
+        # Convert timestamp to readable format - smart detection
+        if last_payment_time > 0:
+            try:
+                # If timestamp > 1e12, it's in milliseconds
+                if last_payment_time > 1000000000000:
+                    dt = datetime.fromtimestamp(last_payment_time / 1000)
+                else:
+                    dt = datetime.fromtimestamp(last_payment_time)
+                payment_time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception as e:
+                logging.debug(f"Timestamp error: {e}")
+                payment_time_str = 'Unknown'
+        else:
+            payment_time_str = 'Not initialized'
+        
+        msg = (
+            f"✅ **Notification System Active**\n\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"🕐 Last Payment Time: {payment_time_str}\n"
+            f"🕐 Last Activity: {activity_str}\n"
+            f"📊 Total users: {len(user_last_payment_time)}\n\n"
+            f"Status: **Monitoring** ✓"
+        )
+    else:
+        msg = (
+            f"❌ **Not Monitored**\n\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"📊 Total users: {len(user_last_payment_time)}\n\n"
+            f"Use /start to activate monitoring"
+        )
+    
+    await event.respond(msg)
 
 
 @client.on(events.CallbackQuery)
@@ -283,6 +718,15 @@ async def callback_handler(event):
     """Handle inline button callbacks"""
     user_id = event.sender_id
     data = event.data.decode()
+    
+    if not hasattr(start_command, '_monitor_started'):
+        asyncio.create_task(monitor_active_users())
+        start_command._monitor_started = True
+        logging.info("🔔 Payment monitoring started")
+     
+    
+    # Mark user as active on any interaction
+    await mark_user_active(user_id)
     
     # Donation recipient user ID (configure this)
     DONATE_USER_ID = int(os.getenv('DONATE_USER_ID', '0'))
@@ -296,6 +740,20 @@ async def callback_handler(event):
             await event.edit("⏳")
             await show_main_menu(event, edit=True)
             await event.answer("✅ Balance refreshed")
+            return
+        
+        elif data == "help":
+            await event.answer()
+            await show_help_menu(event)
+            return
+        
+        elif data == "history":
+            await show_transaction_history(event, user_id, page=0)
+            return
+        
+        elif data.startswith("history_page_"):
+            page = int(data.split("_")[2])
+            await show_transaction_history(event, user_id, page=page)
             return
         
         elif data == "settings":
@@ -369,13 +827,52 @@ async def callback_handler(event):
                 f"📥 **Receive Payment**\n\n"
                 f"⚡ **Your Lightning Address:**\n`{address.lightning_address}`\n\n"
                 f"🔗 **LNURL:**\n`{address.lnurl}`\n\n"
+                f"Choose receive method:",
+                buttons=[
+                    [Button.inline("⚡ Lightning Invoice", b"receive_lightning")],
+                    [Button.inline("₿ Onchain Address", b"receive_onchain")],
+                    [Button.inline("« Back", b"back_to_menu")]
+                ]
+            )
+        
+        elif data == "receive_lightning":
+            await event.answer()
+            address = await get_lightning_address(user_id)
+            await event.edit(
+                f"📥 **Receive via Lightning**\n\n"
+                f"⚡ **Your Lightning Address:**\n`{address.lightning_address}`\n\n"
+                f"🔗 **LNURL:**\n`{address.lnurl}`\n\n"
                 f"💬 Would you like to add a memo/description to your invoice?",
                 buttons=[
                     [Button.inline("💬 Add Memo", b"receive_add_memo")],
                     [Button.inline("⏭ Skip", b"receive_skip_memo")],
-                    [Button.inline("« Back", b"back_to_menu")]
+                    [Button.inline("« Back", b"receive")]
                 ]
             )
+        
+        elif data == "receive_onchain":
+            await event.answer()
+            try:
+                msg = await event.edit("⏳ Generating onchain address...")
+                
+                btc_address, receive_fee = await create_onchain_address(user_id)
+                
+                await msg.edit(
+                    f"📥 **Receive via Onchain**\n\n"
+                    f"₿ **Bitcoin Address:**\n`{btc_address}`\n\n"
+                    f"⚡ **Receive Fee:** {receive_fee} sats\n\n"
+                    f"⚠️ **Note:** Funds will appear after blockchain confirmation\n"
+                    f"💡 Use Lightning for instant payments!",
+                    buttons=[
+                        [Button.inline("« Back to Receive", b"receive")],
+                        [Button.inline("« Back to Menu", b"back_to_menu")]
+                    ]
+                )
+            except Exception as error:
+                await event.edit(
+                    f"❌ Error generating address:\n{error}",
+                    buttons=[[Button.inline("« Back", b"receive")]]
+                )
         
         elif data == "receive_add_memo":
             user_steps[user_id] = "receive_memo"
@@ -383,7 +880,7 @@ async def callback_handler(event):
             await event.edit(
                 "💬 **Add Memo**\n\n"
                 "Enter a description/memo for your invoice:",
-                buttons=[[Button.inline("« Cancel", b"back_to_menu")]]
+                buttons=[[Button.inline("« Cancel", b"receive_lightning")]]
             )
         
         elif data == "receive_skip_memo":
@@ -396,7 +893,7 @@ async def callback_handler(event):
                     "This invoice can accept any amount. Want to set a specific amount?",
                     buttons=[
                         [Button.inline("💵 Set Amount", b"receive_set_amount_no_memo")],
-                        [Button.inline("« Back", b"back_to_menu")]
+                        [Button.inline("« Back", b"receive_lightning")]
                     ]
                 )
             except Exception as error:
@@ -407,7 +904,7 @@ async def callback_handler(event):
             await event.edit(
                 "💵 **Set Invoice Amount**\n\n"
                 "Enter the amount in sats:",
-                buttons=[[Button.inline("« Cancel", b"back_to_menu")]]
+                buttons=[[Button.inline("« Cancel", b"receive_lightning")]]
             )
         
         elif data == "receive_set_amount_no_memo":
@@ -415,7 +912,7 @@ async def callback_handler(event):
             await event.edit(
                 "💵 **Set Invoice Amount**\n\n"
                 "Enter the amount in sats:",
-                buttons=[[Button.inline("« Cancel", b"back_to_menu")]]
+                buttons=[[Button.inline("« Cancel", b"receive_lightning")]]
             )
         
         elif data == "send":
@@ -732,6 +1229,14 @@ async def message_handler(event):
     user_id = event.sender_id
     text = event.text.strip()
     
+    if not hasattr(start_command, '_monitor_started'):
+        asyncio.create_task(monitor_active_users())
+        start_command._monitor_started = True
+        logging.info("🔔 Payment monitoring started")
+     
+    # Mark user as active
+    await mark_user_active(user_id)
+    
     current_step = user_steps.get(user_id)
     
     if not current_step:
@@ -844,8 +1349,402 @@ async def message_handler(event):
                     del user_data[user_id]
             return
         
-        # Handle other message types (recovery, memo, amount, invoice, etc.)
-        # [Rest of message handler code continues...]
+        # Recovery wallet input
+        elif current_step == "recovery_input":
+            words = text.strip()
+            word_list = words.split()
+            
+            if len(word_list) != 12:
+                await event.respond(
+                    "❌ Invalid recovery phrase. Must be exactly 12 words.",
+                    buttons=[[Button.inline("« Cancel", b"settings_back")]]
+                )
+                return
+            
+            # Validate mnemonic
+            try:
+                if not mnemo.check(words):
+                    await event.respond(
+                        "❌ Invalid recovery phrase. Please check your words.",
+                        buttons=[[Button.inline("« Cancel", b"settings_back")]]
+                    )
+                    return
+            except:
+                await event.respond(
+                    "❌ Invalid recovery phrase format.",
+                    buttons=[[Button.inline("« Cancel", b"settings_back")]]
+                )
+                return
+            
+            # Save new seed
+            db.set(f'{user_id}', words)
+            
+            del user_steps[user_id]
+            
+            await event.respond(
+                "✅ **Wallet Recovered!**\n\n"
+                "Your wallet has been restored from the recovery phrase.\n"
+                "Syncing your balance...",
+                buttons=[[Button.inline("« Back to Menu", b"back_to_menu")]]
+            )
+        
+        # Change Lightning address input
+        elif current_step == "change_ln_address_input":
+            username = text.strip().lower()
+            
+            # Validate username format
+            if not username.replace('_', '').isalnum():
+                await event.respond(
+                    "❌ Username can only contain lowercase letters, numbers, and underscores.",
+                    buttons=[[Button.inline("« Cancel", b"settings_back")]]
+                )
+                return
+            
+            try:
+                sdk = await get_wallet(user_id)
+                request = RegisterLightningAddressRequest(username=username, description="Zap Zap")
+                new_address = await sdk.register_lightning_address(request=request)
+                
+                del user_steps[user_id]
+                
+                await event.respond(
+                    f"✅ **Lightning Address Updated!**\n\n"
+                    f"⚡ New Address: `{new_address.lightning_address}`\n"
+                    f"🔗 LNURL: `{new_address.lnurl}`",
+                    buttons=[[Button.inline("« Back to Menu", b"back_to_menu")]]
+                )
+            except Exception as error:
+                await event.respond(
+                    f"❌ Error: {error}\n\n"
+                    "Username might be taken. Try another one.",
+                    buttons=[[Button.inline("« Cancel", b"settings_back")]]
+                )
+        
+        # Receive memo input
+        elif current_step == "receive_memo":
+            memo = text.strip()
+            user_data[user_id]['memo'] = memo
+            user_steps[user_id] = "receive_amount"
+            
+            await event.respond(
+                "💵 **Set Invoice Amount**\n\n"
+                "Enter the amount in sats:",
+                buttons=[[Button.inline("« Cancel", b"back_to_menu")]]
+            )
+        
+        # Receive amount input (with memo)
+        elif current_step == "receive_amount":
+            if not text.isdigit():
+                await event.respond("❌ Please enter a valid number in sats")
+                return
+            
+            amount = int(text)
+            if amount <= 0:
+                await event.respond("❌ Amount must be greater than 0")
+                return
+            
+            memo = user_data.get(user_id, {}).get('memo', 'Zap payment')
+            
+            try:
+                invoice = await create_invoice(user_id, amount_sats=amount, description=memo)
+                
+                del user_steps[user_id]
+                if user_id in user_data:
+                    del user_data[user_id]
+                
+                await event.respond(
+                    f"📥 **Your Invoice**\n\n"
+                    f"💰 Amount: {amount} sats\n"
+                    f"💬 Memo: {memo}\n\n"
+                    f"`{invoice}`",
+                    buttons=[[Button.inline("« Back to Menu", b"back_to_menu")]]
+                )
+            except Exception as error:
+                await event.respond(f"❌ Error: {error}")
+        
+        # Receive amount input (without memo)
+        elif current_step == "receive_amount_no_memo":
+            if not text.isdigit():
+                await event.respond("❌ Please enter a valid number in sats")
+                return
+            
+            amount = int(text)
+            if amount <= 0:
+                await event.respond("❌ Amount must be greater than 0")
+                return
+            
+            try:
+                invoice = await create_invoice(user_id, amount_sats=amount)
+                
+                del user_steps[user_id]
+                
+                await event.respond(
+                    f"📥 **Your Invoice**\n\n"
+                    f"💰 Amount: {amount} sats\n\n"
+                    f"`{invoice}`",
+                    buttons=[[Button.inline("« Back to Menu", b"back_to_menu")]]
+                )
+            except Exception as error:
+                await event.respond(f"❌ Error: {error}")
+        
+        # ==================== SEND: Parse Invoice ====================
+        elif current_step == "send_invoice":
+            try:
+                parsed = await parse_input(text)
+                input_type = parsed
+                details = parsed[0]
+                
+                invoice_text = text
+                needs_amount = False
+                parsed_amount = None
+                input_type_str = "Unknown"
+                
+                # BOLT11 Invoice
+                if isinstance(input_type, InputType.BOLT11_INVOICE):
+                    input_type_str = "BOLT11 Invoice"
+                    if hasattr(details, 'amount_msat') and details.amount_msat:
+                        parsed_amount = details.amount_msat // 1000
+                    else:
+                        needs_amount = True
+                
+                # Lightning Address (LNURL-Pay)
+                elif isinstance(input_type, InputType.LIGHTNING_ADDRESS):
+                    input_type_str = "Lightning Address"
+                    pay_request = details.pay_request
+                    min_sats = pay_request.min_sendable // 1000
+                    max_sats = pay_request.max_sendable // 1000
+                    
+                    user_data[user_id] = {
+                        'pay_request': pay_request,
+                        'payment_type': 'lnurl',
+                        'min_sats': min_sats,
+                        'max_sats': max_sats
+                    }
+                    needs_amount = True
+                
+                # LNURL-Pay
+                elif isinstance(input_type, InputType.LNURL_PAY):
+                    input_type_str = "LNURL-Pay"
+                    min_sats = details.min_sendable // 1000
+                    max_sats = details.max_sendable // 1000
+                    user_data[user_id] = {
+                        'pay_request': details,
+                        'payment_type': 'lnurl',
+                        'min_sats': min_sats,
+                        'max_sats': max_sats
+                    }
+                    needs_amount = True
+                
+                # Bitcoin Address
+                elif isinstance(input_type, InputType.BITCOIN_ADDRESS):
+                    input_type_str = "Bitcoin Address"
+                    user_data[user_id] = {
+                        'address': details.address,
+                        'payment_type': 'onchain',
+                        'invoice': text
+                    }
+                    needs_amount = True
+                
+                # LNURL-Withdraw
+                elif isinstance(input_type, InputType.LNURL_WITHDRAW):
+                    input_type_str = "LNURL-Withdraw"
+                    await event.respond(
+                        "❌ LNURL-Withdraw not supported for sending\n\n"
+                        "Please send a valid:\n"
+                        "• Lightning Invoice\n"
+                        "• Lightning Address\n"
+                        "• Bitcoin Address",
+                        buttons=[[Button.inline("« Cancel", b"back_to_menu")]]
+                    )
+                    return
+                
+                # Store invoice data if not LNURL
+                if 'payment_type' not in user_data.get(user_id, {}):
+                    user_data[user_id] = {
+                        'invoice': invoice_text,
+                        'needs_amount': needs_amount,
+                        'parsed_amount': parsed_amount,
+                        'input_type': input_type_str,
+                        'payment_type': 'bolt11'
+                    }
+                
+                # If needs amount, ask for it
+                if needs_amount:
+                    user_steps[user_id] = "send_amount"
+                    
+                    # Add withdraw all button
+                    buttons = [
+                        [Button.inline("💸 Withdraw All", b"send_withdraw_all")],
+                        [Button.inline("« Cancel", b"back_to_menu")]
+                    ]
+                    
+                    await event.respond(
+                        "💵 **Enter Amount**\n\n"
+                        "How many sats do you want to send?\n\n"
+                        "Or withdraw your entire balance:",
+                        buttons=buttons
+                    )
+                else:
+                    # Prepare payment with parsed amount
+                    user_steps[user_id] = "send_confirm"
+                    await prepare_and_show_fee(event, user_id, invoice_text, parsed_amount)
+                
+            except Exception as error:
+                await event.respond(
+                    f"❌ **Invalid Input**\n\n"
+                    f"Error: {error}\n\n"
+                    f"Please send a valid:\n"
+                    f"• Lightning Invoice (lnbc...)\n"
+                    f"• Lightning Address (user@domain.com)\n"
+                    f"• Bitcoin Address (bc1...)\n"
+                    f"• LNURL\n\n"
+                    f"Or cancel:",
+                    buttons=[[Button.inline("« Cancel", b"back_to_menu")]]
+                )
+            return
+        
+        # Send amount for zero-amount invoice
+        # ==================== SEND: Get Amount ====================
+        elif current_step == "send_amount":
+            if not text.isdigit():
+                await event.respond(
+                    "❌ Please enter a valid number in sats\n\n"
+                    "Try again or cancel:",
+                    buttons=[
+                        [Button.inline("💸 Withdraw All", b"send_withdraw_all")],
+                        [Button.inline("« Cancel", b"back_to_menu")]
+                    ]
+                )
+                return
+            
+            amount = int(text)
+            if amount <= 0:
+                await event.respond(
+                    "❌ Amount must be greater than 0\n\n"
+                    "Try again or cancel:",
+                    buttons=[
+                        [Button.inline("💸 Withdraw All", b"send_withdraw_all")],
+                        [Button.inline("« Cancel", b"back_to_menu")]
+                    ]
+                )
+                return
+            
+            if user_id in user_data:
+                user_data[user_id]['amount'] = amount
+                data = user_data[user_id]
+                payment_type = data.get('payment_type', 'bolt11')
+                
+                # LNURL Payment
+                if payment_type == 'lnurl':
+                    if amount < data['min_sats'] or amount > data['max_sats']:
+                        await event.respond(
+                            f"❌ Amount must be between {data['min_sats']} and {data['max_sats']} sats\n\n"
+                            f"Please enter a valid amount:",
+                            buttons=[
+                                [Button.inline("💸 Withdraw All", b"send_withdraw_all")],
+                                [Button.inline("« Cancel", b"back_to_menu")]
+                            ]
+                        )
+                        return
+                    
+                    try:
+                        res = await event.respond("⚡ Calculating fees...")
+                        prepare_response, fee_sats = await prepare_lnurl_pay(
+                            user_id, data['pay_request'], amount
+                        )
+                        
+                        user_data[user_id]['prepare_response'] = prepare_response
+                        user_data[user_id]['fee'] = fee_sats
+                        
+                        total = amount + fee_sats
+                        
+                        await res.edit(
+                            f"📋 **Payment Summary (LNURL)**\n\n"
+                            f"💰 Amount: {amount} sats\n"
+                            f"⚡ Fee: {fee_sats} sats\n"
+                            f"💳 Total: {total} sats\n\n"
+                            f"Confirm payment?",
+                            buttons=[
+                                [
+                                    Button.inline("✅ Confirm", b"confirm_payment_yes"),
+                                    Button.inline("❌ Cancel", b"back_to_menu")
+                                ]
+                            ]
+                        )
+                        del user_steps[user_id]
+                    except Exception as error:
+                        await event.respond(
+                            f"❌ Error preparing payment:\n{error}\n\n"
+                            f"Please try again or cancel:",
+                            buttons=[
+                                [Button.inline("💸 Withdraw All", b"send_withdraw_all")],
+                                [Button.inline("« Cancel", b"back_to_menu")]
+                            ]
+                        )
+                
+                # Onchain Payment
+                elif payment_type == 'onchain':
+                    try:
+                        res = await event.respond("⚡ Calculating fees...")
+                        prepare_response, _, _ = await prepare_payment(user_id, data['invoice'], amount)
+                        
+                        fee_quote = prepare_response.payment_method.fee_quote
+                        slow_fee = fee_quote.speed_slow.user_fee_sat + fee_quote.speed_slow.l1_broadcast_fee_sat
+                        medium_fee = fee_quote.speed_medium.user_fee_sat + fee_quote.speed_medium.l1_broadcast_fee_sat
+                        fast_fee = fee_quote.speed_fast.user_fee_sat + fee_quote.speed_fast.l1_broadcast_fee_sat
+                        
+                        # Get fee rates (sat/vB)
+                        slow_rate = fee_quote.speed_slow.l1_sat_per_vbyte
+                        medium_rate = fee_quote.speed_medium.l1_sat_per_vbyte
+                        fast_rate = fee_quote.speed_fast.l1_sat_per_vbyte
+                        
+                        user_data[user_id]['prepare_response'] = prepare_response
+                        user_data[user_id]['fees'] = {
+                            'slow': slow_fee,
+                            'medium': medium_fee,
+                            'fast': fast_fee
+                        }
+                        
+                        await res.edit(
+                            f"📋 **Onchain Payment Summary**\n\n"
+                            f"💰 Amount: {amount} sats\n\n"
+                            f"⚡ **Fee Options:**\n"
+                            f"🐢 Slow: {slow_fee} sats ({slow_rate} sat/vB)\n"
+                            f"🚶 Medium: {medium_fee} sats ({medium_rate} sat/vB)\n"
+                            f"🚀 Fast: {fast_fee} sats ({fast_rate} sat/vB)\n\n"
+                            f"Choose confirmation speed:",
+                            buttons=[
+                                [
+                                    Button.inline("🐢 Slow", b"onchain_speed_slow"),
+                                    Button.inline("🚶 Medium", b"onchain_speed_medium"),
+                                    Button.inline("🚀 Fast", b"onchain_speed_fast")
+                                ],
+                                [Button.inline("❌ Cancel", b"back_to_menu")]
+                            ]
+                        )
+                        del user_steps[user_id]
+                    except Exception as error:
+                        await event.respond(
+                            f"❌ Error calculating fees:\n{error}\n\n"
+                            f"Please try again or cancel:",
+                            buttons=[
+                                [Button.inline("💸 Withdraw All", b"send_withdraw_all")],
+                                [Button.inline("« Cancel", b"back_to_menu")]
+                            ]
+                        )
+                
+                # Regular BOLT11 Payment
+                else:
+                    invoice = data['invoice']
+                    user_steps[user_id] = "send_confirm"
+                    await prepare_and_show_fee(event, user_id, invoice, amount)
+            else:
+                await event.respond(
+                    "❌ Session expired, please start again",
+                    buttons=[[Button.inline("« Back to Menu", b"back_to_menu")]]
+                )
+                del user_steps[user_id]
+            return
         
     except Exception as error:
         logging.error(f"Message handler error: {error}")
@@ -961,6 +1860,11 @@ async def tip_handler(event):
 
 
 if __name__ == "__main__":
-    print("🚀 Starting bot...")
+    print("🚀 Starting Zap Wallet Bot...")
     print("📡 Connecting to Telegram...")
+    print("🔔 Notification System: Timestamp-based polling")
+    print("⏱️  Check interval: 30 seconds")
+    print("📊 Batch size: 50 users per cycle")
+    print("✅ Only RECEIVE payments will trigger notifications")
+    
     client.run_until_disconnected()
