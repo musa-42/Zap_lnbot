@@ -9,6 +9,7 @@ from string import ascii_lowercase
 import os
 from dotenv import load_dotenv
 from datetime import datetime
+import threading
 
 load_dotenv()
 
@@ -20,9 +21,10 @@ logging.basicConfig(
 
 mnemo = Mnemonic("english")
 
-# Database configuration
+# Database configuration with lock
 DB_PATH = './db-bot.sqlite'
 db = KeyValueSqlite(DB_PATH, 'table-name')
+db_lock = threading.Lock()  # Thread-safe database access
 
 # Telegram API credentials
 api_id = os.getenv('TELEGRAM_API_ID')
@@ -35,7 +37,8 @@ config.api_key = os.getenv('BREEZ_API_KEY')
 config.prefer_spark_over_lightning = True
 
 # Initialize users list in database
-db.set_default(f'users', [])
+db.set_default('users', [])
+db.set_default('notification_users', {})  # Database table for persistent notifications
 
 # Initialize Telegram client
 client = TelegramClient('bot', api_id, api_hash).start(bot_token=bot_token)
@@ -48,14 +51,116 @@ user_data = {}
 user_last_payment_time = {}  # {user_id: last_payment_timestamp}
 user_last_activity = {}  # {user_id: last_activity_timestamp}
 
+# System uptime tracking
+bot_start_time = None
+
+
+def load_notifications_from_db():
+    """Load notification states from database to memory on startup (thread-safe)"""
+    try:
+        with db_lock:
+            notification_data = db.get('notification_users')
+            if not notification_data:
+                logging.info("📊 No saved notification states found")
+                return 0
+            
+            loaded = 0
+            for user_id_str, data in notification_data.items():
+                if data.get('enabled', False):
+                    user_id = int(user_id_str)
+                    user_last_payment_time[user_id] = data.get('last_timestamp', 0)
+                    user_last_activity[user_id] = datetime.now()
+                    loaded += 1
+            
+            logging.info(f"📊 Loaded {loaded} users with notifications enabled")
+            return loaded
+                    
+    except Exception as error:
+        logging.error(f"Error loading notifications from DB: {error}")
+        return 0
+
+
+def save_notification_to_db(user_id, enabled, last_timestamp=None):
+    """Save notification state to database for persistence (thread-safe)"""
+    try:
+        with db_lock:
+            notification_data = db.get('notification_users')
+            user_id_str = str(user_id)
+            
+            if user_id_str not in notification_data:
+                notification_data[user_id_str] = {}
+            
+            notification_data[user_id_str]['enabled'] = enabled
+            notification_data[user_id_str]['last_activity'] = datetime.now().isoformat()
+            
+            if last_timestamp is not None:
+                notification_data[user_id_str]['last_timestamp'] = last_timestamp
+            
+            db.set('notification_users', notification_data)
+    except Exception as error:
+        logging.error(f"Error saving notification to DB: {error}")
+
+
+def is_notifications_enabled(user_id):
+    """Check if notifications are enabled for user"""
+    return user_id in user_last_payment_time
+
+
+async def disable_notifications(user_id, reason='manual'):
+    """Disable notifications for user (thread-safe)
+    
+    Args:
+        user_id: User ID
+        reason: 'manual' (user choice) or 'auto_inactive' (24h timeout)
+    """
+    if user_id in user_last_payment_time:
+        last_ts = user_last_payment_time[user_id]
+        del user_last_payment_time[user_id]
+    else:
+        last_ts = None
+        
+    if user_id in user_last_activity:
+        del user_last_activity[user_id]
+    
+    # Save to DB with reason (thread-safe)
+    try:
+        with db_lock:
+            notification_data = db.get('notification_users')
+            user_id_str = str(user_id)
+            
+            if user_id_str not in notification_data:
+                notification_data[user_id_str] = {}
+            
+            notification_data[user_id_str]['enabled'] = False
+            notification_data[user_id_str]['disabled_reason'] = reason
+            notification_data[user_id_str]['disabled_at'] = datetime.now().isoformat()
+            
+            if last_ts is not None:
+                notification_data[user_id_str]['last_timestamp'] = last_ts
+            
+            db.set('notification_users', notification_data)
+            
+        logging.info(f"🔕 Disabled notifications for user {user_id} (reason: {reason})")
+    except Exception as error:
+        logging.error(f"Error disabling notifications: {error}")
+
 
 async def mark_user_active(user_id):
-    """Mark user as active"""
+    """Mark user as active - NO auto-enable notifications (thread-safe)"""
     user_last_activity[user_id] = datetime.now()
     
-    # Initialize payment tracking if needed
-    if user_id not in user_last_payment_time:
-        asyncio.create_task(check_new_payments(user_id))
+    # Don't auto-enable anymore - user must manually enable via Settings
+    # Just update activity in DB if already enabled
+    if user_id in user_last_payment_time:
+        try:
+            with db_lock:
+                notification_data = db.get('notification_users')
+                user_id_str = str(user_id)
+                if user_id_str in notification_data:
+                    notification_data[user_id_str]['last_activity'] = datetime.now().isoformat()
+                    db.set('notification_users', notification_data)
+        except Exception as error:
+            logging.debug(f"Error updating activity: {error}")
 
 
 async def check_new_payments(user_id):
@@ -80,6 +185,10 @@ async def check_new_payments(user_id):
             payment_timestamp = getattr(payment, 'timestamp', 0)
             payment_type = getattr(payment, 'payment_type', None)
             
+            # Debug log to see actual timestamp values
+            if payment_timestamp > 0:
+                logging.debug(f"Payment timestamp: {payment_timestamp}, type: {payment_type}")
+            
             # Update latest timestamp
             if payment_timestamp > latest_timestamp:
                 latest_timestamp = payment_timestamp
@@ -90,11 +199,15 @@ async def check_new_payments(user_id):
                 if payment_type == PaymentType.RECEIVE:
                     new_received_payments.append(payment)
         
-        # Update last checked timestamp
+        # Update last checked timestamp IN MEMORY
         user_last_payment_time[user_id] = latest_timestamp
+        
+        # Save to DB to persist across restarts
+        save_notification_to_db(user_id, enabled=True, last_timestamp=latest_timestamp)
         
         # If this is first check (initialization), don't notify
         if last_checked_time == 0:
+            logging.debug(f"[{user_id}] First check - initialized with timestamp {latest_timestamp}")
             return
         
         # Notify user about each new received payment
@@ -133,9 +246,9 @@ async def check_new_payments(user_id):
 
 
 async def monitor_active_users():
-    """Background polling - checks active users every 30s"""
+    """Background polling - checks active users with smart intervals"""
     batch_size = 50
-    check_interval = 10
+    check_interval = 30  # 30 seconds for fast notifications
     inactive_threshold = 86400  # 24 hours
     
     while True:
@@ -190,6 +303,7 @@ async def monitor_active_users():
 
 async def get_balance(user_id):
     """Get wallet balance for a user"""
+    sdk = None
     try:
         sdk = await get_wallet(user_id)
         sdk.sync_wallet(request=SyncWalletRequest())
@@ -199,6 +313,9 @@ async def get_balance(user_id):
     except Exception as error:
         logging.error(f"Error getting balance: {error}")
         return "0"
+    finally:
+        if sdk:
+            await close_wallet(sdk)
 
 
 async def init(user_id):
@@ -213,13 +330,26 @@ async def init(user_id):
 
 
 async def get_wallet(user_id):
-    """Get or create wallet SDK instance"""
-    mnemonic = db.get(f'{user_id}')
-    seed = Seed.MNEMONIC(mnemonic=mnemonic, passphrase=None)
-    sdk = await connect(
-        request=ConnectRequest(config=config, seed=seed, storage_dir=f"./.{user_id}")
-    )
-    return sdk
+    """Get or create wallet SDK instance with connection management"""
+    try:
+        mnemonic = db.get(f'{user_id}')
+        seed = Seed.MNEMONIC(mnemonic=mnemonic, passphrase=None)
+        sdk = await connect(
+            request=ConnectRequest(config=config, seed=seed, storage_dir=f"./.{user_id}")
+        )
+        return sdk
+    except Exception as error:
+        logging.error(f"Error connecting wallet for user {user_id}: {error}")
+        raise
+
+
+async def close_wallet(sdk):
+    """Safely close wallet connection"""
+    try:
+        if sdk:
+            sdk.disconnect()  # No await needed
+    except Exception as error:
+        logging.debug(f"Error closing wallet: {error}")
 
 
 async def create_invoice(user_id, amount_sats=None, description="Zap payment"):
@@ -262,6 +392,7 @@ async def create_onchain_address(user_id):
 
 async def get_payment_history(user_id, limit=20):
     """Get payment history for a user"""
+    sdk = None
     try:
         sdk = await get_wallet(user_id)
         response = await sdk.list_payments(request=ListPaymentsRequest())
@@ -278,6 +409,9 @@ async def get_payment_history(user_id, limit=20):
     except Exception as error:
         logging.error(f"Error getting payment history: {error}")
         raise
+    finally:
+        if sdk:
+            await close_wallet(sdk)
 
 
 async def get_lightning_address(user_id):
@@ -469,6 +603,14 @@ Click "History" to view your recent transactions
 • Backup Seeds - Save your recovery phrase
 • Recovery Wallet - Restore from seed
 • Change Lightning Address - Customize your address
+• **Notifications** - Enable payment alerts (OFF by default)
+
+**🔔 Payment Notifications:**
+• Go to Settings → Notifications
+• Turn ON to receive instant payment alerts
+• Get notified when you receive payments
+• Auto-pauses after 24h inactivity
+• **Note:** Disabled by default to save resources
 
 **💡 Tips:**
 • Keep your seed phrase safe and private
@@ -477,6 +619,8 @@ Click "History" to view your recent transactions
 • Check fees before confirming
 • Always backup before receiving large amounts
 
+**Need more help?**
+Contact: @zap_ln
 """
     
     await event.edit(
@@ -617,7 +761,7 @@ async def prepare_and_show_fee(event, user_id, invoice, amount):
         user_data[user_id]['prepare_response'] = prepare_response
         user_data[user_id]['options'] = SendPaymentOptions.BOLT11_INVOICE(prefer_spark=True)
         
-        # Determine final fee - use spark_fee if available
+        # Use spark_fee if available (even if 0), otherwise use fee_sats
         if spark_fee is not None:
             final_fee = spark_fee
         else:
@@ -654,12 +798,6 @@ async def prepare_and_show_fee(event, user_id, invoice, amount):
 @client.on(events.NewMessage(func=lambda e: e.is_private, pattern='/start'))
 async def start_command(event):
     """Handle /start command"""
-    # Start monitoring task on first user
-    if not hasattr(start_command, '_monitor_started'):
-        asyncio.create_task(monitor_active_users())
-        start_command._monitor_started = True
-        logging.info("🔔 Payment monitoring started")
-    
     # Mark user as active
     await mark_user_active(event.sender_id)
     
@@ -717,12 +855,6 @@ async def callback_handler(event):
     user_id = event.sender_id
     data = event.data.decode()
     
-    if not hasattr(start_command, '_monitor_started'):
-        asyncio.create_task(monitor_active_users())
-        start_command._monitor_started = True
-        logging.info("🔔 Payment monitoring started")
-     
-    
     # Mark user as active on any interaction
     await mark_user_active(user_id)
     
@@ -756,6 +888,7 @@ async def callback_handler(event):
         
         elif data == "settings":
             await event.answer()
+            
             await event.edit(
                 "⚙️ **Settings**\n\n"
                 "Choose an option:",
@@ -763,7 +896,100 @@ async def callback_handler(event):
                     [Button.inline("🔐 Backup Seeds", b"backup")],
                     [Button.inline("🔄 Recovery Wallet", b"recovery")],
                     [Button.inline("⚡ Change Lightning Address", b"change_ln_address")],
+                    [Button.inline("🔔 Notifications", b"notifications_menu")],
                     [Button.inline("« Back to Menu", b"back_to_menu")]
+                ]
+            )
+            return
+        
+        elif data == "notifications_menu":
+            await event.answer()
+            
+            # Check notification status
+            if user_id in user_last_payment_time:
+                notif_status = "✅ **Enabled**"
+                notif_detail = "You're receiving payment notifications every 30 seconds."
+                toggle_text = "🔕 Turn OFF"
+                toggle_action = b"notif_turn_off"
+            else:
+                # Check if manually disabled or auto-paused
+                notification_data = db.get('notification_users')
+                user_data_db = notification_data.get(str(user_id), {})
+                disabled_reason = user_data_db.get('disabled_reason', None)
+                
+                if disabled_reason == 'manual':
+                    notif_status = "❌ **Disabled**"
+                    notif_detail = "You've turned off notifications manually."
+                elif disabled_reason == 'auto_inactive':
+                    notif_status = "⏸️ **Paused**"
+                    notif_detail = "Auto-paused due to 24h inactivity. Will resume when you use the bot."
+                else:
+                    notif_status = "❌ **Not Enabled**"
+                    notif_detail = "Turn on to receive instant payment alerts."
+                
+                toggle_text = "🔔 Turn ON"
+                toggle_action = b"notif_turn_on"
+            
+            await event.edit(
+                f"🔔 **Notifications**\n\n"
+                f"Status: {notif_status}\n\n"
+                f"{notif_detail}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚙️ **Settings:**\n"
+                f"• Check interval: 30 seconds\n"
+                f"• Auto-pause: After 24h inactivity\n"
+                f"• Only RECEIVE payments notify\n",
+                buttons=[
+                    [Button.inline(toggle_text, toggle_action)],
+                    [Button.inline("« Back to Settings", b"settings")]
+                ]
+            )
+            return
+        
+        elif data == "notif_turn_off":
+            # Disable notifications
+            await disable_notifications(user_id, reason='manual')
+            await event.answer("🔕 Notifications disabled")
+            
+            await event.edit(
+                "🔔 **Notifications**\n\n"
+                "Status: ❌ **Disabled**\n\n"
+                "You've turned off notifications manually.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⚙️ **Settings:**\n"
+                "• Check interval: 30 seconds\n"
+                "• Auto-pause: After 24h inactivity\n"
+                "• Only RECEIVE payments notify\n",
+                buttons=[
+                    [Button.inline("🔔 Turn ON", b"notif_turn_on")],
+                    [Button.inline("« Back to Settings", b"settings")]
+                ]
+            )
+            return
+        
+        elif data == "notif_turn_on":
+            # Enable notifications (force enable even if manually disabled)
+            await mark_user_active(user_id)
+            
+            # Force enable
+            if user_id not in user_last_payment_time:
+                asyncio.create_task(check_new_payments(user_id))
+                save_notification_to_db(user_id, enabled=True)
+            
+            await event.answer("🔔 Notifications enabled")
+            
+            await event.edit(
+                "🔔 **Notifications**\n\n"
+                "Status: ✅ **Enabled**\n\n"
+                "You're receiving payment notifications every 30 seconds.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⚙️ **Settings:**\n"
+                "• Check interval: 30 seconds\n"
+                "• Auto-pause: After 24h inactivity\n"
+                "• Only RECEIVE payments notify\n",
+                buttons=[
+                    [Button.inline("🔕 Turn OFF", b"notif_turn_off")],
+                    [Button.inline("« Back to Settings", b"settings")]
                 ]
             )
             return
@@ -816,6 +1042,27 @@ async def callback_handler(event):
                 "Example: `musa_wallet`\n\n"
                 "⚠️ Note: Username must be unique!",
                 buttons=[[Button.inline("« Cancel", b"settings_back")]]
+            )
+        
+        elif data == "toggle_notifications":
+            # Toggle notification status
+            if user_id in user_last_payment_time:
+                # Disable
+                del user_last_payment_time[user_id]
+                if user_id in user_last_activity:
+                    del user_last_activity[user_id]
+                status = "❌ Disabled"
+                message = "🔕 **Notifications Disabled**\n\nYou won't receive payment notifications anymore.\n\nYou can re-enable anytime from Settings."
+            else:
+                # Enable
+                await mark_user_active(user_id)
+                status = "✅ Enabled"
+                message = "🔔 **Notifications Enabled**\n\nYou'll receive instant notifications for incoming payments!\n\nChecks every 2 minutes."
+            
+            await event.answer(f"Notifications {status}")
+            await event.edit(
+                message,
+                buttons=[[Button.inline("« Back to Settings", b"settings")]]
             )
         
         elif data == "receive":
@@ -946,6 +1193,7 @@ async def callback_handler(event):
                     [Button.inline("🔐 Backup Seeds", b"backup")],
                     [Button.inline("🔄 Recovery Wallet", b"recovery")],
                     [Button.inline("⚡ Change Lightning Address", b"change_ln_address")],
+                    [Button.inline("🔔 Notifications", b"notifications_menu")],
                     [Button.inline("« Back to Menu", b"back_to_menu")]
                 ]
             )
@@ -1071,8 +1319,8 @@ async def callback_handler(event):
                 await event.answer("❌ No balance to withdraw")
                 return
             
-            if user_id in user_data and 'invoice' in user_data[user_id]:
-                invoice = user_data[user_id]['invoice']
+            # Check if user has payment data (invoice OR pay_request for LNURL)
+            if user_id in user_data and ('invoice' in user_data[user_id] or 'pay_request' in user_data[user_id]):
                 payment_type = user_data[user_id].get('payment_type', 'bolt11')
                 
                 try:
@@ -1116,47 +1364,111 @@ async def callback_handler(event):
                             ]
                         )
                     else:
-                        prepare_response, fee_sats, spark_fee = await prepare_payment(user_id, invoice, balance)
-                        
-                        final_fee = spark_fee if spark_fee is not None else (fee_sats if fee_sats else 0)
-                        final_amount = balance - final_fee
-                        
-                        if final_amount <= 0:
+                        # Lightning (BOLT11 or LNURL)
+                        if payment_type == 'lnurl':
+                            # LNURL Payment
+                            pay_request = user_data[user_id].get('pay_request')
+                            if not pay_request:
+                                await event.answer("❌ Payment data missing")
+                                return
+                            
+                            min_sats = user_data[user_id].get('min_sats', 0)
+                            max_sats = user_data[user_id].get('max_sats', 0)
+                            
+                            # Check limits
+                            if balance < min_sats:
+                                await res.edit(
+                                    f"❌ **Insufficient Balance**\n\n"
+                                    f"💰 Balance: {balance} sats\n"
+                                    f"📉 Minimum: {min_sats} sats",
+                                    buttons=[[Button.inline("« Back", b"back_to_menu")]]
+                                )
+                                return
+                            
+                            send_amount = min(balance, max_sats)
+                            prepare_response, fee_sats = await prepare_lnurl_pay(user_id, pay_request, send_amount)
+                            final_amount = send_amount - fee_sats
+                            
+                            if final_amount <= 0:
+                                await res.edit("❌ Balance too low after fees", buttons=[[Button.inline("« Back", b"back_to_menu")]])
+                                return
+                            
+                            prepare_response, fee_sats = await prepare_lnurl_pay(user_id, pay_request, final_amount)
+                            user_data[user_id]['prepare_response'] = prepare_response
+                            user_data[user_id]['fee'] = fee_sats
+                            user_data[user_id]['amount'] = final_amount
+                            
                             await res.edit(
-                                f"❌ Insufficient balance\n\n"
-                                f"Balance: {balance} sats\n"
-                                f"Fee: {final_fee} sats\n\n"
-                                f"Cannot withdraw all.",
-                                buttons=[[Button.inline("« Back", b"back_to_menu")]]
-                            )
-                            return
-                        
-                        prepare_response, fee_sats, spark_fee = await prepare_payment(user_id, invoice, final_amount)
-                        final_fee = spark_fee if spark_fee is not None else (fee_sats if fee_sats else 0)
-                        
-                        user_data[user_id]['prepare_response'] = prepare_response
-                        user_data[user_id]['options'] = SendPaymentOptions.BOLT11_INVOICE(prefer_spark=True)
-                        user_data[user_id]['fee'] = final_fee
-                        user_data[user_id]['amount'] = final_amount
-                        
-                        total = final_amount + final_fee
-                        
-                        await res.edit(
-                            f"📋 **Withdraw All - Lightning**\n\n"
-                            f"💰 Balance: {balance} sats\n"
-                            f"⚡ Fee: {final_fee} sats\n"
-                            f"💸 Amount to send: {final_amount} sats\n"
-                            f"💳 Total: {total} sats\n\n"
-                            f"ℹ️ Fee will be deducted from your balance\n\n"
-                            f"Confirm withdrawal?",
-                            buttons=[
-                                [
-                                    Button.inline("✅ Confirm", b"confirm_payment_yes"),
-                                    Button.inline("❌ Cancel", b"back_to_menu")
+                                f"📋 **Withdraw All - Lightning Address**\n\n"
+                                f"💰 Balance: {balance} sats\n"
+                                f"⚡ Fee: {fee_sats} sats\n"
+                                f"💸 Sending: {final_amount} sats\n\n"
+                                f"Confirm?",
+                                buttons=[
+                                    [Button.inline("✅ Confirm", b"confirm_payment_yes"), Button.inline("❌ Cancel", b"back_to_menu")]
                                 ]
-                            ]
-                        )
-                        del user_steps[user_id]
+                            )
+                            if user_id in user_steps:
+                                del user_steps[user_id]
+                        else:
+                            # BOLT11 Invoice
+                            invoice = user_data[user_id].get('invoice')
+                            if not invoice:
+                                await event.answer("❌ Invoice missing")
+                                return
+                            
+                            prepare_response, fee_sats, spark_fee = await prepare_payment(user_id, invoice, balance)
+                            
+                            # Use spark_fee if available, otherwise fee_sats
+                            if spark_fee is not None:
+                                final_fee = spark_fee
+                            else:
+                                final_fee = fee_sats if fee_sats else 0
+                            
+                            final_amount = balance - final_fee
+                            
+                            if final_amount <= 0:
+                                await res.edit(
+                                    f"❌ Insufficient balance\n\n"
+                                    f"Balance: {balance} sats\n"
+                                    f"Fee: {final_fee} sats\n\n"
+                                    f"Cannot withdraw all.",
+                                    buttons=[[Button.inline("« Back", b"back_to_menu")]]
+                                )
+                                return
+                            
+                            prepare_response, fee_sats, spark_fee = await prepare_payment(user_id, invoice, final_amount)
+                            
+                            # Use spark_fee if available, otherwise fee_sats
+                            if spark_fee is not None:
+                                final_fee = spark_fee
+                            else:
+                                final_fee = fee_sats if fee_sats else 0
+                            
+                            user_data[user_id]['prepare_response'] = prepare_response
+                            user_data[user_id]['options'] = SendPaymentOptions.BOLT11_INVOICE(prefer_spark=True)
+                            user_data[user_id]['fee'] = final_fee
+                            user_data[user_id]['amount'] = final_amount
+                            
+                            total = final_amount + final_fee
+                            
+                            await res.edit(
+                                f"📋 **Withdraw All - Lightning**\n\n"
+                                f"💰 Balance: {balance} sats\n"
+                                f"⚡ Fee: {final_fee} sats\n"
+                                f"💸 Amount to send: {final_amount} sats\n"
+                                f"💳 Total: {total} sats\n\n"
+                                f"ℹ️ Fee will be deducted from your balance\n\n"
+                                f"Confirm withdrawal?",
+                                buttons=[
+                                    [
+                                        Button.inline("✅ Confirm", b"confirm_payment_yes"),
+                                        Button.inline("❌ Cancel", b"back_to_menu")
+                                    ]
+                                ]
+                            )
+                            if user_id in user_steps:
+                                del user_steps[user_id]
                         
                 except Exception as error:
                     await event.edit(
@@ -1227,11 +1539,6 @@ async def message_handler(event):
     user_id = event.sender_id
     text = event.text.strip()
     
-    if not hasattr(start_command, '_monitor_started'):
-        asyncio.create_task(monitor_active_users())
-        start_command._monitor_started = True
-        logging.info("🔔 Payment monitoring started")
-     
     # Mark user as active
     await mark_user_active(user_id)
     
@@ -1840,17 +2147,7 @@ async def tip_handler(event):
             f"👤 To: {receiver_name}"
         )
         
-        try:
-            await client.send_message(
-                receiver_id,
-                f"🎉 **You received a zap!**\n\n"
-                f"💰 Amount: {amount} sats\n"
-                f"👤 From: {sender_name}\n"
-                f"📍 In group: {event.chat.title if hasattr(event.chat, 'title') else 'Unknown'}\n\n"
-                f"Use /start to manage your wallet!"
-            )
-        except:
-            pass
+        # Payment notification will be sent automatically by check_new_payments
         
     except Exception as error:
         logging.error(f"Zap error: {error}")
@@ -1858,11 +2155,47 @@ async def tip_handler(event):
 
 
 if __name__ == "__main__":
-    print("🚀 Starting Zap Wallet Bot...")
-    print("📡 Connecting to Telegram...")
-    print("🔔 Notification System: Timestamp-based polling")
-    print("⏱️  Check interval: 30 seconds")
-    print("📊 Batch size: 50 users per cycle")
-    print("✅ Only RECEIVE payments will trigger notifications")
+    # Increase file descriptor limit to prevent "Too many open files"
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 4096), hard))
+        logging.info(f"📊 File descriptor limit: {soft} → {min(hard, 4096)}")
+    except Exception as e:
+        logging.warning(f"Could not increase file descriptor limit: {e}")
+    
+    # Set bot start time for uptime tracking
+    bot_start_time = datetime.now()
+    
+    print("=" * 60)
+    print("🚀 ZAP WALLET BOT v13 - STABLE VERSION")
+    print("=" * 60)
+    print(f"\n📡 Started at: {bot_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("\n🔔 NOTIFICATION SYSTEM:")
+    print("   ⚠️  DISABLED by default")
+    print("   ✅ Enable in: Settings → Notifications")
+    print("   ✅ Database-backed (survives restarts)")
+    print("   ✅ Check interval: 30 seconds")
+    print("   ✅ Auto-pause: After 24h inactivity")
+    print("   ✅ Only RECEIVE payments trigger notifications")
+    print("\n💾 Loading notification states from database...")
+    
+    # Load notification states from DB
+    loaded_users = load_notifications_from_db()
+    
+    print(f"📊 {loaded_users} user(s) have notifications enabled")
+    print("\n🔔 Notification monitor will start with bot...")
+    print("\n✅ Bot is ready and running!")
+    print("=" * 60)
+    
+    # Start monitor in background after event loop is running
+    async def start_background_tasks():
+        await asyncio.sleep(2)  # Wait for bot to be fully ready
+        asyncio.create_task(monitor_active_users())
+        logging.info("🔔 Payment monitoring started")
+    
+    # Use client's loop to start background task
+    client.loop.create_task(start_background_tasks())
     
     client.run_until_disconnected()
+
