@@ -10,6 +10,8 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime
 import threading
+from telethon.tl.types import User, Chat, Channel
+
 
 load_dotenv()
 
@@ -347,7 +349,7 @@ async def close_wallet(sdk):
     """Safely close wallet connection"""
     try:
         if sdk:
-            sdk.disconnect()  # No await needed
+            pass #sdk.disconnect()  # No await needed
     except Exception as error:
         logging.debug(f"Error closing wallet: {error}")
 
@@ -438,7 +440,19 @@ async def parse_input(input_str):
         logging.error(f"Error parsing input: {error}")
         raise
 
-
+async def resolve_username(username):
+    """Resolve Telegram username to Lightning Address"""
+    try:
+        user = await client.get_entity(username)
+        receiver_id = user.id
+        await init(receiver_id)
+        receiver_invoice = await create_invoice(receiver_id)
+        return receiver_invoice
+    except Exception as error:
+        logging.error(f"Error resolving username: {error}")
+        raise
+        
+       
 async def prepare_payment(user_id, invoice, amount_sats=None):
     """Prepare payment and get fee information"""
     try:
@@ -792,6 +806,8 @@ async def prepare_and_show_fee(event, user_id, invoice, amount):
         if user_id in user_steps:
             del user_steps[user_id]
 
+
+# ==================== Event Handlers ====================
 
 # ==================== Event Handlers ====================
 
@@ -1168,6 +1184,7 @@ async def callback_handler(event):
                 "Send me one of:\n"
                 "• Lightning Invoice\n"
                 "• Lightning Address (user@domain.com)\n"
+                "• Telegram Username (@username)\n"
                 "• Bitcoin Address\n"
                 "• LNURL",
                 buttons=[[Button.inline("« Cancel", b"back_to_menu")]]
@@ -1327,7 +1344,13 @@ async def callback_handler(event):
                     res = await event.edit("⚡ Calculating fees for withdrawal...")
                     
                     if payment_type == 'onchain':
-                        prepare_response, _, _ = await prepare_payment(user_id, invoice, balance)
+                        # Get bitcoin address from user_data
+                        btc_address = user_data[user_id].get('invoice') or user_data[user_id].get('address')
+                        if not btc_address:
+                            await event.answer("❌ Bitcoin address missing")
+                            return
+                        
+                        prepare_response, _, _ = await prepare_payment(user_id, btc_address, balance)
                         
                         fee_quote = prepare_response.payment_method.fee_quote
                         slow_fee = fee_quote.speed_slow.user_fee_sat + fee_quote.speed_slow.l1_broadcast_fee_sat
@@ -1795,6 +1818,17 @@ async def message_handler(event):
         # ==================== SEND: Parse Invoice ====================
         elif current_step == "send_invoice":
             try:
+                # Check if it's a username (starts with @)
+                if text.startswith('@'):
+                    lightning_address = await resolve_username(text)
+                    await event.respond(
+                        f"🔍 **Username Detection**\n\n"
+                        f"Resolved: `{text}`\n\n"
+                        f"Processing...",
+                        buttons=[[Button.inline("« Cancel", b"back_to_menu")]]
+                    )
+                    text = lightning_address
+                
                 parsed = await parse_input(text)
                 input_type = parsed
                 details = parsed[0]
@@ -1901,6 +1935,7 @@ async def message_handler(event):
                     f"Please send a valid:\n"
                     f"• Lightning Invoice (lnbc...)\n"
                     f"• Lightning Address (user@domain.com)\n"
+                    f"• Telegram Username (@username)\n"
                     f"• Bitcoin Address (bc1...)\n"
                     f"• LNURL\n\n"
                     f"Or cancel:",
@@ -2065,7 +2100,8 @@ async def message_handler(event):
 @client.on(events.NewMessage(pattern=r'/zap_balance'))
 async def balance_handler(event):
     """Show wallet balance"""
-    user_id = event.sender_id
+    user_id = event.sender_id if event.sender_id else event.chat.id
+    
     await init(user_id)
     balance = await get_balance(user_id)
     
@@ -2075,7 +2111,6 @@ async def balance_handler(event):
     
     await event.reply(message)
 
-
 # ==================== TIP System ====================
 @client.on(events.NewMessage(pattern=r'/zap\s+(\d+)(?:\s+@(\w+))?'))
 async def tip_handler(event):
@@ -2083,7 +2118,7 @@ async def tip_handler(event):
     if event.is_private:
         await event.reply("❌ zap command only works in groups!")
         return
-    
+     
     try:
         match = event.pattern_match
         amount = int(match.group(1))
@@ -2095,6 +2130,9 @@ async def tip_handler(event):
             try:
                 user = await client.get_entity(username)
                 receiver_id = user.id
+                if isinstance(user, Channel):
+                    receiver_id = int(f"-100{user.id}")
+                
             except Exception as error:
                 await event.reply(f"❌ User @{username} not found!")
                 return
@@ -2144,7 +2182,7 @@ async def tip_handler(event):
             f"**⚡️ Zap confirmed!**\n\n"
             f"💰 Amount: {amount} sats\n"
             f"👤 From: {sender_name}\n"
-            f"👤 To: {receiver_name}"
+            f"👤 To: {receiver_name} ID: {receiver_id}"
         )
         
         # Payment notification will be sent automatically by check_new_payments
