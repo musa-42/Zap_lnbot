@@ -1,0 +1,10 @@
+# secrets & runtime state
+.env
+*.session
+*.session-journal
+db-bot.sqlite
+db-bot-backup-*.sqlite
+bot.log
+__pycache__/
+*.pyc
+.encrypt_key.txt

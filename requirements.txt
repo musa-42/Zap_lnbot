@@ -1,0 +1,11 @@
+telethon
+keyvalue-sqlite
+breez-sdk-spark
+mnemonic
+python-dotenv
+qrcode
+pillow
+pyzbar
+cryptography
+bcrypt
+aiohttp
