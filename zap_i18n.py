@@ -50,6 +50,7 @@ EN = {
     'btn_cancel': '« Cancel',
     'btn_tools': '🧰 Tools',
     'btn_confirm': '✅ Confirm',
+    'btn_wd_all': '💰 Withdraw everything',
     'btn_try_again': '🔄 Try Again',
     'btn_skip': '⏭ Skip',
     'balance_line': '💰 Balance: {amount}',
@@ -105,7 +106,7 @@ EN = {
         '`/signmsg` / `/verifymsg` prove ownership\n\n'
         '━━━━━━━━━━━━━━━\n'
         '💡 **Backup your seed phrase — no seed, no wallet!**\n\n'
-        'Need help? @your_bot'
+        'Need help? @zap_ln'
     ),
 
     # ---- send ----
@@ -120,15 +121,38 @@ EN = {
     'btn_ln_invoice': '⚡ Lightning Invoice',
     'btn_onchain': '₿ Onchain Address',
     'btn_exchange': '🔄 Exchange (ff.io)',
-
-    # ---- history ----
+    # ---- USDT/USDC (Spark cross-chain) ----
+    'btn_token_usd': '💵 USDT / USDC',
+    'token_deposit_title': '💵 **Deposit USDT/USDC**\n\nWhich network are you sending from?',
+    'token_withdraw_title': '💵 **Withdraw {asset}**\n\nSend the destination address ({chain}):',
+    'token_wd_amount': '💰 How much do you want to withdraw?\n\n⚡ With your sats converted you can withdraw about:\n💵 **{balance}**',
+    'token_wd_confirm': '💸 **Withdraw {asset}**\n\n💰 Withdraw amount: **exactly {amount} {asset}**\n📍 To: `{address}`\n📡 {chain}\n⛽ Service fee: {svc_sats} sats\n\nConfirm?',
+    'token_recv_ready': '✅ **{asset} deposit — {chain}**\n\n💰 Send exactly: **{amount} {asset}**\n⚡ You get: ≈ {sats}\n⛽ 0.5% service fee deducted from those sats\n\n📍 Address:\n`{address}`\n\n⚠️ {asset} on {chain} only — anything else is lost',
+    'token_no_routes': '❌ No route available right now. Try again later.',
+    'token_parse_fail': '❌ Not a valid {chain} address. Send it again:',
+    'token_amount_bad': '❌ Send a valid amount like `10` or `10.5`',
+    'token_amount_high': '❌ Too much. Balance: **{balance}** — send a smaller amount:',
+    'token_wd_started': '⏳ Withdrawing… this can take a few minutes',
+    'token_wd_done': '✅ **Withdrawal sent**\n\n💰 {amount} {asset} → `{address}`\n📡 {chain}\n🔖 TXID: `{tx}`',
+    'token_wd_failed': '❌ Withdrawal failed: {error}\nYour funds stay in the wallet — try again.',
+    'token_balances': '💵 **Stablecoin balance**\n\n{lines}',
+    'token_none': 'No stablecoin balance yet.',
+    'token_busy': '⏳ Preparing…',
+    'token_dep_amount': '💰 How much **{asset}** on {chain}? (e.g. `10`)',
+    'token_withdraw_pick': '💵 **Withdraw USDT/USDC**\n\nPick the token:',
+    'token_chain_pick': '📡 Which network?',
+    'btn_track': '🔍 Track deposit',
+    'btn_track_refresh': '🔄 Refresh',
+    'track_waiting': '⏳ No deposit yet.\n\n💵 Waiting for: {amount} {asset} on {chain}\n🕐 {mins} min since the address was made\n\nDeposits usually take 5–30 min. Your deposit is registered — I\'ll notify you the second it lands.',
+    'track_found': '✅ **Deposit detected!**\n\n💰 {sats} sats\n🔖 Status: {status}\n🔖 Ref: `{tx}`\n\n(0.5% service fee is deducted from these sats)',
+    'track_no_pending': 'No pending deposit. Make a deposit first.',
     'history_title': '📜 **History** — page {page}',
     'history_empty': 'Nothing here yet. Send or receive your first sats!',
     'btn_prev': '⬅️ Previous',
     'btn_next': 'Next ➡️',
 
     # ---- donate ----
-    'donate_title': '💝 **Support This Bot**\n\nThank you for considering to support!\n\nYou can donate in two ways:\n\n1️⃣ **Zap directly to this bot:**\n   Just send a payment to the bot!\n\n2️⃣ **Send to developer:**\n   `your_wallet@example.com`\n\nEvery zap helps keep this bot running! ⚡',
+    'donate_title': '💝 **Support This Bot**\n\nThank you for considering to support!\n\nYou can donate in two ways:\n\n1️⃣ **Zap directly to this bot:**\n   Just send a payment to the bot!\n\n2️⃣ **Send to developer:**\n   `your@ln.tips`\n\nEvery zap helps keep this bot running! ⚡',
     'btn_zap_now': '⚡ Zap Now',
     'donate_amount_title': '💝 **Donate Amount**\n\nHow many sats would you like to donate?\n\nSuggested amounts:\n• 1,000 sats (☕ Coffee)\n• 5,000 sats (🍕 Pizza)\n• 10,000 sats (❤️ Supporter)\n• 21,000 sats (🚀 Champion!)\n➡️ Send the amount (sats or $USD):',
     'btn_cancel_donate': '« Cancel',
@@ -141,11 +165,8 @@ EN = {
     'synced': '✅ Synced.\n💰 Balance: **{balance} sats**',
     'buy_title': '🟧 **Buy Bitcoin**\n\n{url}',
     'fees_loading': '⛽ Loading...',
-    'buy_title': '🟧 **Buy Bitcoin**\n\n{url}',
-    'fees_loading': '⛽ Loading...',
     'sync_loading': '🔄 Syncing...',
     # ---- receive v2 (user-friendly) ----
-    'receive_title': '📥 **Receive**',
     'your_ln_address': 'Your Lightning Address',
     'invoice_no_amount_title': '📥 **Your Invoice** (no amount set)',
     'btn_set_amount': '💵 Set Amount',
@@ -175,8 +196,6 @@ EN = {
     'hist_received': 'Received',
     'hist_sent': 'Sent',
     'hist_details': 'Details',
-    'btn_prev': '⬅️ Previous',
-    'btn_next': 'Next ➡️',
     'btn_scan_payment': '🔍 Scan Payment',
     'hist_error': '❌ Error loading history:\n{error}',
     # ---- ff.io exchange ----
@@ -195,6 +214,7 @@ FA = {
     'btn_refresh': '🔄 بروزرسانی', 'btn_back_menu': '« منو', 'btn_back_settings': '« تنظیمات',
     'btn_back_tools': '« ابزارها', 'btn_cancel': '« لغو', 'btn_tools': '🧰 ابزارها',
     'btn_confirm': '✅ تایید', 'btn_try_again': '🔄 تلاش دوباره', 'btn_skip': '⏭ رد کردن',
+    'btn_wd_all': '💰 برداشت کل موجودی',
     'balance_line': '💰 موجودی:\n{amount}',
     'backup_seed_hint': '🛡 عبارت بازیابی رو در ⚙️ تنظیمات بکاپ بگیر',
     'tools_title': '🧰 **ابزارها**\n\nیک ابزار انتخاب کن:',
@@ -234,7 +254,7 @@ FA = {
         '`/signmsg` / `/verifymsg` اثبات مالکیت\n\n'
         '━━━━━━━━━━━━━━━\n'
         '💡 **عبارت بازیابی رو بکاپ بگیر — بدون seed کیف پولی نیست!**\n\n'
-        'سوال داری؟ @your_bot'
+        'سوال داری؟ @zap_ln'
     ),
     'send_title': '📤 **ارسال**',
     'send_prompt': 'فاکتور، LNURL، آدرس لایتنینگ، @یوزرنیم یا آدرس bc1 رو پیست کن.\nمبلغ دلاری مثل `$5` هم قبوله.',
@@ -244,10 +264,35 @@ FA = {
     'receive_title': '📥 **دریافت**\n\nروش دریافت رو انتخاب کن:',
     'btn_ln_invoice': '⚡ فاکتور لایتنینگ', 'btn_onchain': '₿ آدرس آنچین',
     'btn_exchange': '🔄 صرافی (ff.io)',
+    # ---- USDT/USDC (Spark cross-chain) ----
+    'btn_token_usd': '💵 تتر / یو‌اس‌دی‌سی',
+    'token_deposit_title': '💵 **واریز تتر/یو‌اس‌دی‌سی**\n\nاز کدوم شبکه می‌خوای بفرستی؟',
+    'token_withdraw_title': '💵 **برداشت {asset}**\n\nآدرس مقصد رو بفرست (شبکه {chain}):',
+    'token_wd_amount': '💰 چقدر می‌خوای برداشت کنی؟\n\n⚡ با تبدیل ساتوشی‌هات تقریباً می‌تونی اینقدر برداشت کنی:\n💵 **{balance}**',
+    'token_wd_confirm': '💸 **برداشت {asset}**\n\n💰 مبلغ برداشت: **دقیقاً {amount} {asset}**\n📍 به: `{address}`\n📡 شبکه {chain}\n⛽ کارمزد سرویس: {svc_sats} sats\n\nتایید می‌کنی؟',
+    'token_recv_ready': '✅ **واریز {asset} — شبکه {chain}**\n\n💰 بفرست: دقیقاً **{amount} {asset}**\n⚡ می‌رسه: ≈ {sats}\n⛽ کارمزد سرویس ۰.۵٪ از همین ساتوشی‌ها کسر می‌شه\n\n📍 آدرس:\n`{address}`\n\n⚠️ فقط {asset} روی {chain} — چیز دیگه‌ای بفرستی پول می‌سوزه',
+    'token_no_routes': '❌ فعلاً مسیری در دسترس نیست. یه کم بعداً امتحان کن.',
+    'token_parse_fail': '❌ آدرس {chain} معتبر نیست. دوباره بفرست:',
+    'token_amount_bad': '❌ یه عدد درست بفرست، مثل `10` یا `10.5`',
+    'token_amount_high': '❌ بیشتر از موجودیه. موجودی: **{balance}** — عدد کمتری بفرست:',
+    'token_wd_started': '⏳ در حال برداشت… چند دقیقه طول می‌کشه',
+    'token_wd_done': '✅ **برداشت شد**\n\n💰 {amount} {asset} → `{address}`\n📡 {chain}\n🔖 TXID: `{tx}`',
+    'token_wd_failed': '❌ برداشت ناموفق: {error}\nپولت سر جاشه — دوباره امتحان کن.',
+    'token_balances': '💵 **موجودی تتر/یو‌اس‌دی‌سی**\n\n{lines}',
+    'btn_track': '🔍 پیگیری واریز',
+    'btn_track_refresh': '🔄 دوباره چک کن',
+    'track_waiting': '⏳ هنوز نرسیده.\n\n💵 در انتظار: {amount} {asset} روی {chain}\n🕐 {mins} دقیقه از ساخت آدرس گذشته\n\nواریزها معمولاً ۵ تا ۳۰ دقیقه طول می‌کشه. واریزت ثبت شده — همین لحظه که رسید خبرت می‌کنم.',
+    'track_found': '✅ **واریزت رسید!**\n\n💰 {sats} sats\n🔖 وضعیت: {status}\n🔖 رهگیری: `{tx}`\n\n(کارمزد سرویس ۰.۵٪ از همین ساتوشی‌ها کسر می‌شه)',
+    'track_no_pending': 'واریزی در انتظار نیست. اول یه واریز بساز.',
+    'token_none': 'هنوز موجودی تتر/یو‌اس‌دی‌سی نداری.',
+    'token_busy': '⏳ دارم آماده می‌کنم…',
+    'token_dep_amount': '💰 چند **{asset}** روی {chain} واریز می‌کنی؟ (مثلاً `10`)',
+    'token_withdraw_pick': '💵 **برداشت تتر/یو‌اس‌دی‌سی**\n\nکدوم توکن؟',
+    'token_chain_pick': '📡 کدوم شبکه؟',
     'history_title': '📜 **تاریخچه** — صفحه {page}',
     'history_empty': 'هنوز چیزی اینجا نیست. اولین ساتوشی‌هات رو بفرست یا دریافت کن!',
     'btn_prev': '⬅️ قبلی', 'btn_next': 'بعدی ➡️',
-    'donate_title': '💝 **حمایت از ربات**\n\nممنون که به حمایت فکر کردی!\n\nدو راه داری:\n\n1️⃣ **زپ مستقیم به ربات:**\n   فقط یه پرداخت به ربات بفرست!\n\n2️⃣ **واریز به توسعه‌دهنده:**\n   `your_wallet@example.com`\n\nهر زپ به ادامه کار ربات کمک میکنه! ⚡',
+    'donate_title': '💝 **حمایت از ربات**\n\nممنون که به حمایت فکر کردی!\n\nدو راه داری:\n\n1️⃣ **زپ مستقیم به ربات:**\n   فقط یه پرداخت به ربات بفرست!\n\n2️⃣ **واریز به توسعه‌دهنده:**\n   `your@ln.tips`\n\nهر زپ به ادامه کار ربات کمک میکنه! ⚡',
     'btn_zap_now': '⚡ زپ کن',
     'donate_amount_title': '💝 **مبلغ حمایت**\n\nچند ساتوشی میخوای حمایت کنی؟\n\nمبلغ‌های پیشنهادی:\n• 1,000 ساتوشی (☕ قهوه)\n• 5,000 ساتوشی (🍕 پیتزا)\n• 10,000 ساتوشی (❤️ حامی)\n• 21,000 ساتوشی (🚀 قهرمان!)\n➡️ مبلغ رو بفرست (ساتوشی یا دلار):',
     'err_generic': '❌ {error}',
@@ -257,11 +302,8 @@ FA = {
     'synced': '✅ همگام شد.\n💰 موجودی: **{balance} ساتوشی**',
     'buy_title': '🟧 **خرید بیت‌کوین**\n\n{url}',
     'fees_loading': '⛽ در حال بارگذاری...',
-    'buy_title': '🟧 **خرید بیت‌کوین**\n\n{url}',
-    'fees_loading': '⛽ در حال بارگذاری...',
     'sync_loading': '🔄 در حال همگام‌سازی...',
     # ---- receive v2 ----
-    'receive_title': '📥 **دریافت**',
     'your_ln_address': 'آدرس لایتنینگ شما',
     'invoice_no_amount_title': '📥 **فاکتور شما** (بدون مبلغ)',
     'btn_set_amount': '💵 تعیین مبلغ',
@@ -291,8 +333,6 @@ FA = {
     'hist_received': 'دریافت شد',
     'hist_sent': 'ارسال شد',
     'hist_details': 'جزئیات',
-    'btn_prev': '⬅️ قبلی',
-    'btn_next': 'بعدی ➡️',
     'btn_scan_payment': '🔍 بررسی پرداخت',
     'hist_error': '❌ خطا در بارگذاری تاریخچه:\n{error}',
     # ---- ff.io exchange ----
@@ -349,7 +389,7 @@ RU = {
         '`/signmsg` / `/verifymsg` подтверждение владения\n\n'
         '━━━━━━━━━━━━━━━\n'
         '💡 **Сделайте копию seed — без seed нет кошелька!**\n\n'
-        'Нужна помощь? @your_bot'
+        'Нужна помощь? @zap_ln'
     ),
     'send_title': '📤 **Отправить**',
     'send_prompt': 'Вставьте инвойс, LNURL, lightning адрес, @username или bc1 адрес.\nСуммы вроде `$5` тоже работают.',
@@ -362,7 +402,7 @@ RU = {
     'history_title': '📜 **История** — стр. {page}',
     'history_empty': 'Здесь пока пусто. Отправьте или получите первые сатоши!',
     'btn_prev': '⬅️ Назад', 'btn_next': 'Вперёд ➡️',
-    'donate_title': '💝 **Поддержать бота**\n\nСпасибо, что думаете о поддержке!\n\nДва способа:\n\n1️⃣ **Зап напрямую боту:**\n   Просто отправьте платёж боту!\n\n2️⃣ **Разработчику:**\n   `your_wallet@example.com`\n\nКаждый зап помогает боту работать! ⚡',
+    'donate_title': '💝 **Поддержать бота**\n\nСпасибо, что думаете о поддержке!\n\nДва способа:\n\n1️⃣ **Зап напрямую боту:**\n   Просто отправьте платёж боту!\n\n2️⃣ **Разработчику:**\n   `your@ln.tips`\n\nКаждый зап помогает боту работать! ⚡',
     'btn_zap_now': '⚡ Запнуть',
     'donate_amount_title': '💝 **Сумма доната**\n\nСколько сатоши хотите отправить?\n\nРекомендуемые суммы:\n• 1,000 сатоши (☕ Кофе)\n• 5,000 сатоши (🍕 Пицца)\n• 10,000 сатоши (❤️ Поддержка)\n• 21,000 сатоши (🚀 Чемпион!)\n➡️ Отправьте сумму (сатоши или $USD):',
     'err_generic': '❌ {error}',
@@ -372,11 +412,8 @@ RU = {
     'synced': '✅ Синхронизировано.\n💰 Баланс: **{balance} сатоши**',
     'buy_title': '🟧 **Купить Bitcoin**\n\n{url}',
     'fees_loading': '⛽ Загрузка...',
-    'buy_title': '🟧 **Купить Bitcoin**\n\n{url}',
-    'fees_loading': '⛽ Загрузка...',
     'sync_loading': '🔄 Синхронизация...',
     # ---- receive v2 ----
-    'receive_title': '📥 **Получить**',
     'your_ln_address': 'Ваш Lightning адрес',
     'invoice_no_amount_title': '📥 **Ваш инвойс** (без суммы)',
     'btn_set_amount': '💵 Указать сумму',
@@ -406,8 +443,6 @@ RU = {
     'hist_received': 'Получено',
     'hist_sent': 'Отправлено',
     'hist_details': 'Детали',
-    'btn_prev': '⬅️ Назад',
-    'btn_next': 'Вперёд ➡️',
     'btn_scan_payment': '🔍 Проверить платёж',
     'hist_error': '❌ Ошибка загрузки истории:\n{error}',
     # ---- ff.io ----
@@ -464,7 +499,7 @@ ZH = {
         '`/signmsg` / `/verifymsg` 所有权证明\n\n'
         '━━━━━━━━━━━━━━━\n'
         '💡 **备份您的助记词 — 没有助记词就没有钱包!**\n\n'
-        '需要帮助? @your_bot'
+        '需要帮助? @zap_ln'
     ),
     'send_title': '📤 **发送**',
     'send_prompt': '粘贴发票、LNURL、闪电地址、@用户名或 bc1 地址。\n也支持 `$5` 这样的金额。',
@@ -477,7 +512,7 @@ ZH = {
     'history_title': '📜 **历史** — 第 {page} 页',
     'history_empty': '这里还是空的。发送或接收您的第一聪吧！',
     'btn_prev': '⬅️ 上一页', 'btn_next': '下一页 ➡️',
-    'donate_title': '💝 **支持本机器人**\n\n感谢您的支持！\n\n两种捐赠方式：\n\n1️⃣ **直接给机器人发 ZAP：**\n   直接给机器人发送付款即可！\n\n2️⃣ **发送给开发者：**\n   `your_wallet@example.com`\n\n每个 ZAP 都能帮助机器人运行！⚡',
+    'donate_title': '💝 **支持本机器人**\n\n感谢您的支持！\n\n两种捐赠方式：\n\n1️⃣ **直接给机器人发 ZAP：**\n   直接给机器人发送付款即可！\n\n2️⃣ **发送给开发者：**\n   `your@ln.tips`\n\n每个 ZAP 都能帮助机器人运行！⚡',
     'btn_zap_now': '⚡ 立即 ZAP',
     'donate_amount_title': '💝 **捐赠金额**\n\n您想捐赠多少聪？\n\n建议金额：\n• 1,000 聪 (☕ 咖啡)\n• 5,000 聪 (🍕 披萨)\n• 10,000 聪 (❤️ 支持者)\n• 21,000 聪 (🚀 冠军！)\n➡️ 发送金额 (聪或美元):',
     'err_generic': '❌ {error}',
@@ -487,11 +522,8 @@ ZH = {
     'synced': '✅ 已同步。\n💰 余额: **{balance} 聪**',
     'buy_title': '🟧 **购买比特币**\n\n{url}',
     'fees_loading': '⛽ 加载中...',
-    'buy_title': '🟧 **购买比特币**\n\n{url}',
-    'fees_loading': '⛽ 加载中...',
     'sync_loading': '🔄 同步中...',
     # ---- receive v2 ----
-    'receive_title': '📥 **接收**',
     'your_ln_address': '您的闪电地址',
     'invoice_no_amount_title': '📥 **您的发票** (未设金额)',
     'btn_set_amount': '💵 设置金额',
@@ -521,8 +553,6 @@ ZH = {
     'hist_received': '已接收',
     'hist_sent': '已发送',
     'hist_details': '详情',
-    'btn_prev': '⬅️ 上一页',
-    'btn_next': '下一页 ➡️',
     'btn_scan_payment': '🔍 查询付款',
     'hist_error': '❌ 加载历史出错：\n{error}',
     # ---- ff.io ----
@@ -579,7 +609,7 @@ AR = {
         '`/signmsg` / `/verifymsg` إثبات الملكية\n\n'
         '━━━━━━━━━━━━━━━\n'
         '💡 **احفظ عبارة الاسترداد — بدون عبارة لا محفظة!**\n\n'
-        'تحتاج مساعدة؟ @your_bot'
+        'تحتاج مساعدة؟ @zap_ln'
     ),
     'send_title': '📤 **إرسال**',
     'send_prompt': 'الصق فاتورة أو LNURL أو عنوان برق أو @مستخدم أو عنوان bc1.\nالمبالغ مثل `$5` مدعومة أيضاً.',
@@ -592,7 +622,7 @@ AR = {
     'history_title': '📜 **السجل** — صفحة {page}',
     'history_empty': 'لا شيء هنا بعد. أرسل أو استلم أول ساتوشي!',
     'btn_prev': '⬅️ السابق', 'btn_next': 'التالي ➡️',
-    'donate_title': '💝 **دعم البوت**\n\nشكراً لتفكيرك في الدعم!\n\nطريقتان للتبرع:\n\n1️⃣ **زاب مباشرة للبوت:**\n   أرسل الدفعة للبوت مباشرة!\n\n2️⃣ **إلى المطور:**\n   `your_wallet@example.com`\n\nكل زاب يساعد في استمرار البوت! ⚡',
+    'donate_title': '💝 **دعم البوت**\n\nشكراً لتفكيرك في الدعم!\n\nطريقتان للتبرع:\n\n1️⃣ **زاب مباشرة للبوت:**\n   أرسل الدفعة للبوت مباشرة!\n\n2️⃣ **إلى المطور:**\n   `your@ln.tips`\n\nكل زاب يساعد في استمرار البوت! ⚡',
     'btn_zap_now': '⚡ زاب الآن',
     'donate_amount_title': '💝 **مبلغ التبرع**\n\nكم ساتوشي تريد التبرع؟\n\nمبالغ مقترحة:\n• 1,000 ساتوشي (☕ قهوة)\n• 5,000 ساتوشي (🍕 بيتزا)\n• 10,000 ساتوشي (❤️ داعم)\n• 21,000 ساتوشي (🚀 بطل!)\n➡️ أرسل المبلغ (ساتوشي أو دولار):',
     'err_generic': '❌ {error}',
@@ -602,11 +632,8 @@ AR = {
     'synced': '✅ تمت المزامنة.\n💰 الرصيد: **{balance} ساتوشي**',
     'buy_title': '🟧 **شراء بيتكوين**\n\n{url}',
     'fees_loading': '⛽ جار التحميل...',
-    'buy_title': '🟧 **شراء بيتكوين**\n\n{url}',
-    'fees_loading': '⛽ جار التحميل...',
     'sync_loading': '🔄 جار المزامنة...',
     # ---- receive v2 ----
-    'receive_title': '📥 **استلام**',
     'your_ln_address': 'عنوان البرق الخاص بك',
     'invoice_no_amount_title': '📥 **فاتورتك** (بدون مبلغ)',
     'btn_set_amount': '💵 تحديد المبلغ',
@@ -636,8 +663,6 @@ AR = {
     'hist_received': 'استلام',
     'hist_sent': 'إرسال',
     'hist_details': 'التفاصيل',
-    'btn_prev': '⬅️ السابق',
-    'btn_next': 'التالي ➡️',
     'btn_scan_payment': '🔍 فحص الدفعة',
     'hist_error': '❌ خطأ في تحميل السجل:\n{error}',
     # ---- ff.io ----
@@ -694,7 +719,7 @@ ES = {
         '`/signmsg` / `/verifymsg` probar propiedad\n\n'
         '━━━━━━━━━━━━━━━\n'
         '💡 **¡Respalda tu semilla — sin semilla no hay monedero!**\n\n'
-        '¿Necesitas ayuda? @your_bot'
+        '¿Necesitas ayuda? @zap_ln'
     ),
     'send_title': '📤 **Enviar**',
     'send_prompt': 'Pega una factura, LNURL, dirección Lightning, @usuario o dirección bc1.\nMontos como `$5` también funcionan.',
@@ -707,7 +732,7 @@ ES = {
     'history_title': '📜 **Historial** — pág. {page}',
     'history_empty': 'Nada aquí todavía. ¡Envía o recibe tus primeros sats!',
     'btn_prev': '⬅️ Anterior', 'btn_next': 'Siguiente ➡️',
-    'donate_title': '💝 **Apoya este bot**\n\n¡Gracias por considerar apoyar!\n\nDos formas de donar:\n\n1️⃣ **Zap directo al bot:**\n   ¡Solo envía un pago al bot!\n\n2️⃣ **Al desarrollador:**\n   `your_wallet@example.com`\n\n¡Cada zap ayuda a mantener el bot! ⚡',
+    'donate_title': '💝 **Apoya este bot**\n\n¡Gracias por considerar apoyar!\n\nDos formas de donar:\n\n1️⃣ **Zap directo al bot:**\n   ¡Solo envía un pago al bot!\n\n2️⃣ **Al desarrollador:**\n   `your@ln.tips`\n\n¡Cada zap ayuda a mantener el bot! ⚡',
     'btn_zap_now': '⚡ Zap ahora',
     'donate_amount_title': '💝 **Monto de donación**\n\n¿Cuántos sats quieres donar?\n\nMontos sugeridos:\n• 1,000 sats (☕ Café)\n• 5,000 sats (🍕 Pizza)\n• 10,000 sats (❤️ Seguidor)\n• 21,000 sats (🚀 ¡Campeón!)\n➡️ Envía el monto (sats o $USD):',
     'err_generic': '❌ {error}',
@@ -717,11 +742,8 @@ ES = {
     'synced': '✅ Sincronizado.\n💰 Saldo: **{balance} sats**',
     'buy_title': '🟧 **Comprar Bitcoin**\n\n{url}',
     'fees_loading': '⛽ Cargando...',
-    'buy_title': '🟧 **Comprar Bitcoin**\n\n{url}',
-    'fees_loading': '⛽ Cargando...',
     'sync_loading': '🔄 Sincronizando...',
     # ---- receive v2 ----
-    'receive_title': '📥 **Recibir**',
     'your_ln_address': 'Tu dirección Lightning',
     'invoice_no_amount_title': '📥 **Tu factura** (sin monto)',
     'btn_set_amount': '💵 Fijar monto',
@@ -751,8 +773,6 @@ ES = {
     'hist_received': 'Recibido',
     'hist_sent': 'Enviado',
     'hist_details': 'Detalles',
-    'btn_prev': '⬅️ Anterior',
-    'btn_next': 'Siguiente ➡️',
     'btn_scan_payment': '🔍 Ver pago',
     'hist_error': '❌ Error al cargar el historial:\n{error}',
     # ---- ff.io ----
@@ -809,7 +829,7 @@ TR = {
         '`/signmsg` / `/verifymsg` sahiplik kanıtı\n\n'
         '━━━━━━━━━━━━━━━\n'
         '💡 **Seed ifrenizi yedekleyin — seed yoksa cüzdan yok!**\n\n'
-        'Yardım mı lazım? @your_bot'
+        'Yardım mı lazım? @zap_ln'
     ),
     'send_title': '📤 **Gönder**',
     'send_prompt': 'Fatura, LNURL, Lightning adresi, @kullanıcı veya bc1 adresi yapıştırın.\n`$5` gibi tutarlar da çalışır.',
@@ -822,7 +842,7 @@ TR = {
     'history_title': '📜 **Geçmiş** — sayfa {page}',
     'history_empty': "Burada henüz bir şey yok. İlk satoshi'nizi gönderin veya alın!",
     'btn_prev': '⬅️ Önceki', 'btn_next': 'Sonraki ➡️',
-    'donate_title': '💝 **Bu botu destekle**\n\nDesteklemeyi düşündüğünüz için teşekkürler!\n\nİki bağış yolu:\n\n1️⃣ **Doğrudan bota zap:**\n   Bota bir ödeme gönderin!\n\n2️⃣ **Geliştiriciye:**\n   `your_wallet@example.com`\n\nHer zap botun çalışmasına yardım eder! ⚡',
+    'donate_title': '💝 **Bu botu destekle**\n\nDesteklemeyi düşündüğünüz için teşekkürler!\n\nİki bağış yolu:\n\n1️⃣ **Doğrudan bota zap:**\n   Bota bir ödeme gönderin!\n\n2️⃣ **Geliştiriciye:**\n   `your@ln.tips`\n\nHer zap botun çalışmasına yardım eder! ⚡',
     'btn_zap_now': '⚡ Şimdi zapla',
     'donate_amount_title': '💝 **Bağış miktarı**\n\nKaç satoshi bağışlamak istersiniz?\n\nÖnerilen miktarlar:\n• 1,000 satoshi (☕ Kahve)\n• 5,000 satoshi (🍕 Pizza)\n• 10,000 satoshi (❤️ Destekçi)\n• 21,000 satoshi (🚀 Şampiyon!)\n➡️ Tutarı gönderin (satoshi veya dolar):',
     'err_generic': '❌ {error}',
@@ -832,11 +852,8 @@ TR = {
     'synced': '✅ Senkronize edildi.\n💰 Bakiye: **{balance} satoshi**',
     'buy_title': '🟧 **Bitcoin satın al**\n\n{url}',
     'fees_loading': '⛽ Yükleniyor...',
-    'buy_title': '🟧 **Bitcoin satın al**\n\n{url}',
-    'fees_loading': '⛽ Yükleniyor...',
     'sync_loading': '🔄 Senkronize ediliyor...',
     # ---- receive v2 ----
-    'receive_title': '📥 **Al**',
     'your_ln_address': 'Lightning adresiniz',
     'invoice_no_amount_title': '📥 **Faturanız** (tutar yok)',
     'btn_set_amount': '💵 Tutar ayarla',
@@ -866,8 +883,6 @@ TR = {
     'hist_received': 'Alındı',
     'hist_sent': 'Gönderildi',
     'hist_details': 'Detaylar',
-    'btn_prev': '⬅️ Önceki',
-    'btn_next': 'Sonraki ➡️',
     'btn_scan_payment': '🔍 Ödemeyi sorgula',
     'hist_error': '❌ Geçmiş yüklenirken hata:\n{error}',
     # ---- ff.io ----
@@ -996,10 +1011,6 @@ def detect_lang_code(telegram_lang_code):
     if not telegram_lang_code:
         return None
     return LANG_ALIASES.get(telegram_lang_code.lower().strip())
-
-
-def is_rtl(user_id):
-    return get_user_lang(user_id) in RTL_LANGS
 
 
 def t(user_id, key, **kwargs):
