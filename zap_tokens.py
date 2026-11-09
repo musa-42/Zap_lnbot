@@ -15,8 +15,9 @@ Docs: sdk-doc-spark.breez.technology/guide/cross_chain.html
 
 All functions are wallet-agnostic: they take the sdk instance + user_id.
 """
+import asyncio
 import logging
-import time
+import math
 
 import breez_sdk_spark as bss
 
@@ -25,14 +26,34 @@ import breez_sdk_spark as bss
 # config.html stable-balance section documents the USDB btkn1… identifier)
 USDB_TOKEN_ID = "btkn1xgrvjwey5ngcagvap2dzzvsy4uk8ua9x69k82dwvt5e7ef9drm9qztux87"
 
-# Friendly chain names
-_CHAIN_FA = {
-    "tron": "ترون (TRC20)",
-    "solana": "سولانا",
-    "base": "بیس",
-    "arbitrum one": "آربیتروم",
-    "ethereum": "اتریوم",
+
+# ---------------------------------------------------------------------------
+# User-facing error codes (item 24): every raise site throws a terse stable
+# code; the wallet renders it via err_generic. These map each code to a t()
+# key whose pack values carry TODAY'S bytes everywhere (owner decision #8) —
+# so rendering is byte-identical and translating later is a pack-only edit.
+_TOKEN_ERR_KEYS = {
+    "no_routes": "tok_no_routes",
+    "conversion not confirmed": "tok_conversion_unconfirmed",
+    "invalid amount": "tok_invalid_amount",
+    "route does not accept USDB": "tok_route_no_usdb",
+    "unknown provider": "tok_unknown_provider",
+    "incomplete route identity": "tok_route_identity",
+    "prepared route or destination changed": "tok_route_changed",
+    "unexpected funding or conversion": "tok_unexpected_funding",
+    "invalid quote amounts": "tok_invalid_quote",
+    "unsupported withdrawal provider": "tok_unsupported_provider",
+    "missing quote correlation": "tok_missing_correlation",
 }
+
+
+def user_err_text(uid, err):
+    """Translate a zap_tokens raise code for rendering; unknown errors
+    (SDK messages etc.) pass through unchanged."""
+    from zap_i18n import t
+    s = str(err)
+    key = _TOKEN_ERR_KEYS.get(s)
+    return t(uid, key) if key else s
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +68,11 @@ async def get_routes(sdk, direction="receive", contract_address=None, address_de
     NOTE: every BreezSdk method is async in the python binding (0.26.1).
     """
     if direction == "send":
-        flt = bss.CrossChainRouteFilter.SEND(address_details=address_details)
+        flt = bss.CrossChainRouteFilter.SEND(
+            address_details=address_details, delivery_method=None)
     else:
-        flt = bss.CrossChainRouteFilter.RECEIVE(contract_address=contract_address)
+        flt = bss.CrossChainRouteFilter.RECEIVE(
+            contract_address=contract_address, delivery_method=None)
     return await sdk.get_cross_chain_routes(filter=flt)
 
 
@@ -124,8 +147,10 @@ async def route_bounds(sdk, direction, asset_symbol="USDT", chain=None, address_
                 if lims.get("max_usd_cents") is not None:
                     cur = usd["max_usd"]
                     usd["max_usd"] = lims["max_usd_cents"] / 100 if cur is None else min(cur, lims["max_usd_cents"] / 100)
-    except Exception:
-        pass
+    except Exception as e:
+        # fail-open by design (quote identity pinned); make the degradation visible
+        logging.warning("route_bounds: live limits unavailable (%s) — falling back to "
+                        "observed minimums", e)
     if usd["min_usd"] is None and direction == "receive":
         usd["min_usd"] = RECEIVE_MIN_USDT
     if usd["min_usd"] is None and direction == "send":
@@ -173,8 +198,9 @@ async def make_deposit(sdk, asset_symbol: str, chain: str, amount_external_base:
     routes = pick_routes(await get_routes(sdk), asset_symbol)
     if not routes:
         raise RuntimeError("no_routes")
-    entry = next((r for r in routes if r["chain"].lower() == chain.lower()),
-                 routes[0])
+    entry = next((r for r in routes if r["chain"].lower() == chain.lower()), None)
+    if entry is None:
+        raise RuntimeError("no_routes")
     pair = entry["pair"]
 
     req = bss.ReceivePaymentRequest(
@@ -279,45 +305,33 @@ async def convert_sats_to_usdb(sdk, usdb_base: int):
         if await usdb_raw_balance(sdk) >= usdb_base * 0.98:
             return payment
         await asyncio.sleep(1)
-    return payment
+    # item 7c: a FROM_BITCOIN self-send whose credit never landed is a
+    # failure, not a silent success
+    raise RuntimeError("conversion not confirmed")
 
 
 async def prepare_withdraw(sdk, asset_symbol: str, chain: str, dest_address: str,
                            amount_external_base: int, address_details=None):
-    """Prepare an external USDT/USDC send. Returns (prepare_response, entry).
-
-    Uses PaymentRequest.CROSS_CHAIN {address, route} per the docs — the SDK
-    quotes provider fees and auto-converts the Spark-side funding asset.
-    Funding priority: USDB token on Spark — falls back to BTC sats when the
-    route accepts it or the wallet holds no USDB. Amount is in the EXTERNAL
-    asset base units.
-    """
+    """Prepare a USDB-funded withdrawal without performing a conversion."""
+    if int(amount_external_base or 0) <= 0:
+        raise RuntimeError("invalid amount")
     routes = pick_routes(await get_routes(sdk, direction="send", address_details=address_details),
                          asset_symbol)
     if not routes:
         raise RuntimeError("no_routes")
     fam_chain = chain.lower()
-    entry = next((r for r in routes if fam_chain in r["chain"].lower()
-                  or r["chain"].lower() in fam_chain), routes[0])
+    entry = next((r for r in routes if fam_chain == r["chain"].lower()), None)
+    if entry is None:
+        raise RuntimeError("no_routes")
     pair = entry["pair"]
 
-    # Funding asset: USDB if this route accepts it, else BTC sats
     spark_asset = bss.SparkAsset.TOKEN(token_identifier=USDB_TOKEN_ID)
-    try:
-        accepted = getattr(pair, "accepted_assets", None) or []
-        tokens_ok = any(
-            str(getattr(aa, "asset", "")).startswith("SparkAsset.TOKEN")
-            for aa in accepted)
-        if not tokens_ok:
-            spark_asset = bss.SparkAsset.BITCOIN()
-    except Exception:
-        spark_asset = bss.SparkAsset.BITCOIN()
+    accepted = getattr(pair, "accepted_assets", None) or []
+    if not any(isinstance(getattr(aa, "asset", None), bss.SparkAsset.TOKEN)
+               and aa.asset.token_identifier == USDB_TOKEN_ID for aa in accepted):
+        raise RuntimeError("route does not accept USDB")
 
-    token_identifier = USDB_TOKEN_ID if spark_asset.is_TOKEN() else None
-    if token_identifier and await usdb_raw_balance(sdk) <= 0:
-        # Nothing in USDB — self-convert sats→USDB first (FROM_BITCOIN conversion
-        # is NOT supported on cross-chain sends, but IS on plain spark self-sends)
-        await convert_sats_to_usdb(sdk, amount_external_base)
+    token_identifier = USDB_TOKEN_ID
 
     req = bss.PrepareSendPaymentRequest(
         payment_request=bss.PaymentRequest.CROSS_CHAIN(
@@ -329,51 +343,120 @@ async def prepare_withdraw(sdk, asset_symbol: str, chain: str, dest_address: str
         amount=amount_external_base,
         token_identifier=token_identifier,
         conversion_options=None,
-        fee_policy=None,
+        fee_policy=bss.FeePolicy.FEES_INCLUDED,
     )
-    try:
-        prep = await sdk.prepare_send_payment(request=req)
-    except Exception as first_err:
-        # TOKEN funding can still be short: the quote's amount_in includes the
-        # network fee. Top up USDB from sats and retry ONCE.
-        if token_identifier and "insufficient" in str(first_err).lower():
-            bal = await usdb_raw_balance(sdk)
-            # conservative top-up: the requested amount + 15% for fees/slippage
-            need = amount_external_base + int(amount_external_base * 0.15) - bal
-            if need > 0:
-                await convert_sats_to_usdb(sdk, need)
-            prep = await sdk.prepare_send_payment(request=req)
-        else:
-            raise
-    # EXECUTE-side shortfall data for execute_withdraw's retry:
-    # the quote's amount_in (amount + network fee) may exceed the USDB balance at
-    # send time → convert the shortfall from sats, re-prepare, retry ONCE there.
+    # Preparation is read-only: never convert funds as a side effect of quoting.
+    prep = await sdk.prepare_send_payment(request=req)
     pm = getattr(prep, "payment_method", None)
     amount_in_needed = int(getattr(pm, "amount_in", 0) or 0)
     return prep, entry, spark_asset, amount_in_needed, req
 
 
-async def execute_withdraw(sdk, prep, amount_in_needed=0, req=None):
-    """Send a prepared cross-chain withdrawal. Returns the Payment.
+def format_base_units(raw, decimals):
+    raw, decimals = int(raw), int(decimals)
+    if raw < 0 or not 0 <= decimals <= 30:
+        raise ValueError('invalid amount')
+    whole, fraction = divmod(raw, 10 ** decimals)
+    return str(whole) if not fraction else f"{whole}.{fraction:0{decimals}d}".rstrip('0')
 
-    On 'insufficient funds' at send time (quote amount_in > wallet USDB),
-    converts the shortfall from sats, re-prepares and retries ONCE.
-    """
+
+def _route_identity(route):
+    provider = route.provider
+    if not isinstance(provider, bss.CrossChainProvider):
+        raise ValueError('unknown provider')
+    if not route.chain or not route.asset or not route.contract_address:
+        raise ValueError('incomplete route identity')
+    return (provider.name, route.chain, route.chain_id, route.asset,
+            route.contract_address, int(route.decimals))
+
+
+def withdraw_quote(prep, requested_route, address, token_identifier):
+    """Fingerprint the actual SDK prepare response, not a fresh route lookup."""
+    pm = prep.payment_method
+    identity = _route_identity(pm.route)
+    if identity != _route_identity(requested_route) or pm.recipient_address != address:
+        raise ValueError('prepared route or destination changed')
+    if (prep.token_identifier != token_identifier or prep.conversion_estimate is not None
+            or prep.fee_policy != bss.FeePolicy.FEES_INCLUDED):
+        raise ValueError('unexpected funding or conversion')
+    amounts = tuple(int(getattr(pm, key)) for key in
+                    ('amount_in', 'asset_amount_in', 'estimated_out', 'fee_amount',
+                     'source_transfer_fee_sats'))
+    if min(amounts) < 0 or not amounts[0] or not amounts[2] or int(prep.amount) != amounts[0]:
+        raise ValueError('invalid quote amounts')
+    return (identity, address, token_identifier, int(prep.amount), str(prep.fee_policy),
+            str(pm.fee_mode), *amounts)
+
+
+def withdraw_source_outcome(status):
+    return 'pending' if status in (bss.PaymentStatus.COMPLETED, bss.PaymentStatus.PENDING) else 'unknown'
+
+
+def withdraw_quote_id(prep):
+    context = getattr(prep.payment_method, 'provider_context', None)
+    if not isinstance(context, bss.CrossChainProviderContext.ORCHESTRA):
+        raise ValueError('unsupported withdrawal provider')
+    quote_id = context.quote_id
+    if not isinstance(quote_id, str) or not quote_id or len(quote_id) > 256:
+        raise ValueError('missing quote correlation')
+    return quote_id
+
+
+def withdrawal_evidence(payment, quote_id, quote):
+    """Only exact Orchestra send + quote + full destination identity is evidence."""
     try:
-        resp = await sdk.send_payment(
-            request=bss.SendPaymentRequest(prepare_response=prep, options=None))
-        return getattr(resp, "payment", None)
-    except Exception as e:
-        if "insufficient" not in str(e).lower() or req is None:
-            raise
-        bal = await usdb_raw_balance(sdk)
-        need = max(amount_in_needed, 0) - bal + int(max(amount_in_needed, 1) * 0.05)
-        if need > 0:
-            await convert_sats_to_usdb(sdk, need)
-        prep = await sdk.prepare_send_payment(request=req)
-        resp = await sdk.send_payment(
-            request=bss.SendPaymentRequest(prepare_response=prep, options=None))
-        return getattr(resp, "payment", None)
+        ci = payment.details.conversion_info
+        route, address, token, amount, _, _, _, asset_in, estimated, _, _ = quote
+        if (not isinstance(payment.details, bss.PaymentDetails.TOKEN)
+                or payment.method != bss.PaymentMethod.TOKEN
+                or payment.details.tx_type != bss.TokenTransactionType.TRANSFER
+                or payment.details.metadata.identifier != token
+                or payment.amount != amount
+                or payment.conversion_details is not None
+                or not isinstance(ci, bss.ConversionInfo.ORCHESTRA)
+                or payment.payment_type != bss.PaymentType.SEND
+                or not payment.id or ci.quote_id != quote_id
+                or route[0] != 'ORCHESTRA' or token != USDB_TOKEN_ID
+                or (ci.chain, ci.chain_id, ci.asset, ci.asset_contract, ci.asset_decimals)
+                   != (route[1], route[2], route[3], route[4], route[5])
+                or ci.recipient_address != address or ci.asset_amount_in != asset_in
+                or ci.estimated_out != estimated):
+            return 'unknown'
+        status = bss.ConversionStatus
+        if ci.status == status.COMPLETED:
+            if (payment.status == bss.PaymentStatus.COMPLETED
+                    and ci.external_tx_hash and ci.delivered_amount is not None):
+                if int(ci.delivered_amount) >= int(estimated):
+                    return 'delivered'
+                return 'partial_delivery'
+            return 'unknown'
+        if (ci.status == status.REFUNDED and payment.status == bss.PaymentStatus.COMPLETED
+                and not ci.external_tx_hash):
+            return 'refunded'
+        if ci.status == status.REFUND_NEEDED:
+            return 'refund_needed'
+        if ci.status == status.FAILED:
+            return 'failed_unproven'
+        if ci.status == status.PENDING:
+            return 'pending'
+    except (AttributeError, TypeError, ValueError, IndexError):
+        pass
+    return 'unknown'
+
+
+async def find_withdrawal_payment(sdk, quote_id, payment_id=''):
+    """SDK history has no total/cursor or snapshot guarantee: retain the hold.
+
+    A short page is not proof of a complete stable history, even with a known ID.
+    """
+    return None
+
+
+async def execute_withdraw(sdk, prep, amount_in_needed=0, req=None):
+    """Submit once. Any exception may have occurred after funds were sent."""
+    resp = await sdk.send_payment(
+        request=bss.SendPaymentRequest(prepare_response=prep, options=None))
+    return getattr(resp, "payment", None)
 
 
 def fmt_amount(human: float) -> str:
@@ -420,13 +503,21 @@ def parse_human_amount(text: str):
     t = (text or "").strip().replace(",", ".").replace("٫", ".")
     try:
         v = float(t)
-        return v if v > 0 else None
+        return v if math.isfinite(v) and v > 0 else None
     except ValueError:
         return None
 
 
 def to_base_units(human: float, decimals: int) -> int:
-    return int(round(human * (10 ** decimals)))
+    from decimal import Decimal
+    # guard (item 7b): zero/negative/dust amounts must raise the generic
+    # 'invalid amount' error, never silently become a 0-base-unit send
+    if not math.isfinite(float(human)) or float(human) <= 0:
+        raise ValueError('invalid amount')
+    base = int(round(Decimal(str(human)) * (10 ** decimals)))
+    if base <= 0:
+        raise ValueError('invalid amount')
+    return base
 
 
 def from_base_units(raw: int, decimals: int) -> float:

@@ -1,10 +1,15 @@
-# secrets & runtime state
-.env
+# secrets & runtime state — never commit
+.env*
 *.session
 *.session-journal
-db-bot.sqlite
-db-bot-backup-*.sqlite
-bot.log
+*.db
+*.db-*
+*.sqlite*
 __pycache__/
 *.pyc
+*.bak-*
+*.bak
+*.bak2-*
+bot.log
 .encrypt_key.txt
+.p2p_escrow*

@@ -76,12 +76,14 @@ FFIO_API_KEY=                     # ff.io exchange keys (optional feature)
 FFIO_API_SECRET=
 FFIO_REFCODE=
 BACKUP_CHANNEL_ID=0               # private channel id for periodic backups
+P2P_LIST_CHANNEL=0                # public channel id for P2P order listings
+P2P_TEST_USERS=all                # or comma-separated user ids while testing
 ```
 
 ### Run
 
 ```bash
-python3 zap_wallet_bot.py
+python3 zap_wallet_bot_v32.py
 ```
 
 The bot token is read from `.env` (with a hidden `getpass` prompt fallback).
@@ -97,7 +99,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=/opt/zap-lnbot
-ExecStart=/usr/bin/python3 zap_wallet_bot.py
+ExecStart=/usr/bin/python3 zap_wallet_bot_v32.py
 Restart=always
 RestartSec=5
 
@@ -108,9 +110,12 @@ WantedBy=multi-user.target
 ## 🗂 Project Structure
 
 ```
-zap_wallet_bot.py   # main bot (~9k lines): handlers, wallet logic, exchange
-zap_i18n.py         # i18n engine + 12 language packs
-.env                # secrets (never committed)
+zap_wallet_bot_v32.py   # main bot: handlers, wallet logic, exchange
+zap_p2p.py              # P2P exchange: escrow, trades, disputes
+zap_tokens.py           # tokens (Spark assets): deposit / cross-chain withdraw
+zap_i18n.py             # i18n engine + 12 language packs
+test_*.py               # offline regression test suite
+.env                    # secrets (never committed)
 ```
 
 ## 🔐 Security Notes
@@ -203,12 +208,14 @@ FFIO_API_KEY=                     # کلیدهای صرافی ff.io (ویژگی 
 FFIO_API_SECRET=
 FFIO_REFCODE=
 BACKUP_CHANNEL_ID=0               # آی‌دی کانال خصوصی برای بکاپ دوره‌ای
+P2P_LIST_CHANNEL=0                # آی‌دی کانال عمومی سفارش‌های P2P
+P2P_TEST_USERS=all                # یا آی‌دی‌ها با کاما برای فاز تست
 ```
 
 **اجرا:**
 
 ```bash
-python3 zap_wallet_bot.py
+python3 zap_wallet_bot_v32.py
 ```
 
 توکن بات از `.env` خونده می‌شه (با fallback ورود مخفی `getpass`).

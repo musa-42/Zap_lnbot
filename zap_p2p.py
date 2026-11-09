@@ -1,7 +1,7 @@
-"""P2P exchange section for Zap_lnBot — owner + test users only (P2P_TEST_USERS).
+"""P2P exchange section for Zap_lnBot (public or P2P_TEST_USERS allowlist).
 
 Design (owner-approved v3):
-- Escrow: dedicated wallet, seed at /root/mzap/.p2p_escrow_seed (chmod 600),
+- Escrow: dedicated wallet, seed path from P2P_ESCROW_SEED_PATH (chmod 600),
   storage ./.p2p_escrow. Seller locks sats+fee with a zero-fee internal spark
   send; release pays the buyer's in-bot wallet directly; fee (0.5%) sweeps to
   the owner (DONATE_USER_ID). All wallet plumbing reuses the bot's own
@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -43,7 +44,8 @@ async def offloop(coro):
         loop.close()
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'p2p.db')
-ESCROW_SEED_PATH = '/root/mzap/.p2p_escrow_seed'
+ESCROW_SEED_PATH = os.getenv('P2P_ESCROW_SEED_PATH') or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '.p2p_escrow_seed')
 ESCROW_STORAGE_DIR = './.p2p_escrow'
 
 FEE_BPS = 50                      # 0.5% — seller pays
@@ -59,6 +61,7 @@ ST_FIAT = 'fiat_sent'
 ST_PAYOUT = 'payout'
 ST_REFUND = 'refunding'
 ST_DONE = 'done'
+ST_INVALIDATED = 'invalidated'
 ST_REFUNDED = 'refunded'
 ST_DISPUTED = 'disputed'
 ST_CANCELED = 'canceled'
@@ -68,7 +71,7 @@ _db = None
 _escrow = None
 _escrow_lock = asyncio.Lock()
 _last_panel = {}   # uid -> (chat_id, msg_id) last buttoned p2p panel
-P2P_LIST_CHANNEL = -1004462652956   # «Zap P2P list» public order channel
+P2P_LIST_CHANNEL = int(os.getenv('P2P_LIST_CHANNEL', '0') or 0)   # «Zap P2P list» public order channel
 _mem_wiz = {}       # in-process fallback
 _db_wiz_ready = False
 
@@ -96,13 +99,6 @@ class _WizShelf(dict):
                 _mem_wiz[k] = v     # adopt as live object for this process
                 return v
         return _mem_wiz.get(k)
-
-    def __contains__(self, k):
-        if k in _mem_wiz:
-            return True
-        if isinstance(k, int) and _wiz_table():
-            return bool(_rows('SELECT uid FROM wiz WHERE uid=?', (k,)))
-        return False
 
     def __setitem__(self, k, v):
         _mem_wiz[k] = v
@@ -178,10 +174,12 @@ CREATE TABLE IF NOT EXISTS trades (
     panels TEXT DEFAULT '{}',
     payout_id TEXT, payout_tries INTEGER DEFAULT 0,
     refund_id TEXT, refund_tries INTEGER DEFAULT 0,
-    fee_paid INTEGER DEFAULT 0, fee_tries INTEGER DEFAULT 0,
+    fee_paid INTEGER DEFAULT 0, fee_tries INTEGER DEFAULT 0, fee_safe INTEGER DEFAULT 0,
     dispute_reason TEXT,
     chat_open INTEGER DEFAULT 0, chat_off_seller INTEGER DEFAULT 0,
-    chat_off_buyer INTEGER DEFAULT 0, premium REAL);
+    chat_off_buyer INTEGER DEFAULT 0, premium REAL,
+    lock_sent INTEGER DEFAULT 0, lock_pay_id TEXT, escrow_verified INTEGER DEFAULT 0,
+    safety_version INTEGER DEFAULT 0, locked_at REAL, lock_amount INTEGER);
 ''')
         db.executescript('''
 CREATE TABLE IF NOT EXISTS ratings (
@@ -193,7 +191,44 @@ CREATE TABLE IF NOT EXISTS p2p_admins (
     uid INTEGER PRIMARY KEY, added_by INTEGER, at REAL);
 CREATE TABLE IF NOT EXISTS chat_msgs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, tid INTEGER, uid INTEGER, text TEXT, at REAL);
+CREATE TABLE IF NOT EXISTS escrow_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, payment_id TEXT UNIQUE,
+    direction TEXT NOT NULL, amount TEXT NOT NULL, status TEXT NOT NULL,
+    conflict INTEGER NOT NULL DEFAULT 0, first_seen REAL NOT NULL, last_seen REAL NOT NULL,
+    reviewed_by INTEGER, reviewed_at REAL, review_note TEXT);
+CREATE TABLE IF NOT EXISTS escrow_observations (
+    event_id INTEGER NOT NULL, direction TEXT NOT NULL, amount TEXT NOT NULL,
+    status TEXT NOT NULL, observed_at REAL NOT NULL,
+    UNIQUE(event_id,direction,amount,status));
+CREATE TABLE IF NOT EXISTS escrow_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL,
+    direction TEXT NOT NULL, amount TEXT NOT NULL, status TEXT NOT NULL,
+    sent_at REAL, UNIQUE(event_id,direction,amount,status));
+CREATE TABLE IF NOT EXISTS escrow_reviews (
+    event_id INTEGER NOT NULL, uid INTEGER NOT NULL, reviewed_at REAL NOT NULL,
+    note TEXT NOT NULL, UNIQUE(event_id,reviewed_at));
+CREATE TABLE IF NOT EXISTS escrow_adjudications (
+    id INTEGER PRIMARY KEY, trade_id INTEGER NOT NULL, kind TEXT NOT NULL,
+    event_id INTEGER NOT NULL UNIQUE, payment_id TEXT NOT NULL UNIQUE,
+    direction TEXT NOT NULL, amount TEXT NOT NULL, status TEXT NOT NULL,
+    admin_uid INTEGER NOT NULL, adjudicated_at REAL NOT NULL,
+    UNIQUE(trade_id,kind));
+CREATE TABLE IF NOT EXISTS escrow_admin_actions (
+    id INTEGER PRIMARY KEY, trade_id INTEGER NOT NULL, kind TEXT NOT NULL,
+    admin_uid INTEGER NOT NULL, acted_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS escrow_fee_attempts (
+    trade_id INTEGER PRIMARY KEY, admin_uid INTEGER NOT NULL, claimed_at REAL NOT NULL,
+    amount INTEGER NOT NULL, payment_id TEXT, bound_at REAL);
+CREATE TABLE IF NOT EXISTS escrow_confirmations (
+    nonce TEXT PRIMARY KEY, uid INTEGER NOT NULL, trade_id INTEGER NOT NULL,
+    action TEXT NOT NULL, expires REAL NOT NULL, consumed_at REAL);
+CREATE TABLE IF NOT EXISTS escrow_trade_notices (
+    trade_id INTEGER NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL,
+    sent_at REAL, PRIMARY KEY(trade_id,kind,target));
 ''')
+        # Import previous reviews and unresolved alerts without losing history.
+        db.execute("INSERT OR IGNORE INTO escrow_reviews SELECT id,reviewed_by,reviewed_at,review_note FROM escrow_events WHERE reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL AND review_note IS NOT NULL")
+        db.execute("INSERT OR IGNORE INTO escrow_alerts(event_id,direction,amount,status) SELECT o.event_id,o.direction,o.amount,o.status FROM escrow_observations o JOIN escrow_events e ON e.id=o.event_id WHERE o.direction='RECEIVE' OR o.status IN ('FAILED','ID_REUSED') OR e.conflict=1")
         cols = {r[1] for r in db.execute('PRAGMA table_info(orders)').fetchall()}
         if 'ttl_secs' not in cols:
             db.execute('ALTER TABLE orders ADD COLUMN ttl_secs REAL')
@@ -208,10 +243,27 @@ CREATE TABLE IF NOT EXISTS chat_msgs (
             if col not in tcols:
                 db.execute(f'ALTER TABLE trades ADD COLUMN {col} INTEGER DEFAULT 0')
         for col, typ in (('fiat_final', 'REAL'), ('rate_used', 'REAL'),
-                         ('premium', 'REAL')):
+                         ('premium', 'REAL'),
+                         ('lock_sent', 'INTEGER DEFAULT 0'), ('lock_pay_id', 'TEXT'),
+                         ('fee_safe', 'INTEGER DEFAULT 0'), ('escrow_verified', 'INTEGER DEFAULT 0'),
+                         ('safety_version', 'INTEGER DEFAULT 0'), ('locked_at', 'REAL'),
+                         ('lock_amount', 'INTEGER')):
             if col not in tcols:
                 db.execute(f'ALTER TABLE trades ADD COLUMN {col} {typ}')
-        db.commit()
+        # Old locking rows may have sent money before lock_sent existed.  The
+        # version is explicit on creation, so a crash/restart cannot reclassify
+        # a new trade as old; repeating this migration is harmless.
+        db.execute("UPDATE trades SET lock_sent=1 WHERE stage=? AND COALESCE(safety_version,0)=0", (ST_LOCKING,))
+        db.execute("UPDATE trades SET locked_at=COALESCE(updated,created) WHERE stage=? AND locked_at IS NULL", (ST_LOCKED,))
+        # Recover already-conflicted terminal records from older deployments.
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            for event in db.execute('SELECT id FROM escrow_events WHERE conflict=1').fetchall():
+                _invalidate_event_trades(db, event['id'])
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
 
 def _rows(sql, args=()):
@@ -246,8 +298,8 @@ def set_agreed(uid):
 def _bot():
     """The RUNNING bot module.
 
-    The service executes zap_wallet_bot_v31.py as __main__; a plain
-    `import zap_wallet_bot_v31` here creates a SECOND module instance with
+    The service executes zap_wallet_bot_v32.py as __main__; a plain
+    `import zap_wallet_bot_v32` here creates a SECOND module instance with
     cipher_suite=None (seeds fail to decrypt → "invalid word count: 1") and an
     empty active_user_connections. Always resolve the live __main__ first.
     """
@@ -255,8 +307,8 @@ def _bot():
     m = sys.modules.get('__main__')
     if m is not None and hasattr(m, 'get_wallet'):
         return m
-    import zap_wallet_bot_v31
-    return zap_wallet_bot_v31
+    import zap_wallet_bot_v32
+    return zap_wallet_bot_v32
 
 
 def p2p_public():
@@ -328,6 +380,82 @@ def unban_user(uid):
 
 TXT = {
  'fa': {
+  'holds_title': 'عملیات متوقف‌شده: سوابق کیف پول را بررسی کنید؛ نتیجه نامعلوم را دوباره ارسال نکنید.',
+  'events_title': 'رویدادهای بدون انتساب یا متناقض؛ بررسی وجهی جابه‌جا نمی‌کند.',
+  'event_missing': 'رویداد پیدا نشد.', 'event_detail': 'رویداد #{id}\nشناسه پرداخت: {pid}\n{direction} {amount} · {status}\nتناقض: {conflict}\nمشاهدات:\n{evidence}\nبررسی: {review}\nهویت اثبات نشده؛ بررسی به معنی انتساب یا انتقال وجه نیست.',
+  'not_reviewed': 'بررسی نشده', 'record_evidence': 'ثبت مدرک', 'events_back': '« رویدادها',
+  'event_review_prompt': 'مدرک را بدون اطلاعات محرمانه بفرستید. فقط بررسی ثبت می‌شود و پولی جابه‌جا نمی‌شود.',
+  'event_review_saved': 'مدرک ثبت شد؛ رویداد بدون انتساب می‌ماند و پولی جابه‌جا نشده.',
+  'event_review_failed': 'بررسی ثبت نشد: مدرک خالی، قبلاً بررسی‌شده یا دسترسی نامعتبر.',
+  'holds_panel': 'عملیات متوقف', 'events_panel': 'بررسی رویدادهای اسکرو',
+  'next': 'بعدی', 'admin_back': '« پنل', 'holds_back': '« موارد متوقف', 'cancel_admin': 'انصراف',
+  'admin_only': 'فقط ادمین', 'trade_missing': 'معامله پیدا نشد.', 'unknown': 'نامعلوم',
+  'hold_detail': 'معامله #{id} · {stage}\nخریدار: {buyer} · فروشنده: {seller}\nشناسه قفل: {lock}\nشناسه پرداخت: {payout}\nشناسه بازگشت: {refund}\nکارمزد: {fee} · تلاش‌ها: {tries} · شناسه: {fee_id}\nنتیجه نامعلوم را نگه دارید؛ نبود شناسه اثبات عدم پرداخت نیست.',
+  'send_fee': 'ارسال کارمزد (یک تلاش)',
+  'mark_settled_payout': 'ثبت تسویه پرداخت (نیازمند مدرک)',
+  'mark_settled_refund': 'ثبت تسویه بازگشت (نیازمند مدرک)',
+  'mark_settled_fee': 'ثبت تسویه کارمزد (نیازمند مدرک)',
+  'hold_conflict_title': '\n⚠️ مدارک متناقض:\n{lines}',
+  'hold_open_case': '⚖️ پرونده اختلاف',
+  'confirm_fee_text': 'ارسال یک‌باره {fee} سات کارمزد به مالک را تأیید کنید. نتیجه نامعلوم قابل تکرار نیست.',
+  'confirm_fee': 'تأیید ارسال کارمزد', 'confirmation_invalid': 'تأیید نامعتبر یا منقضی است.',
+  'legacy_warning': 'معامله قدیمی است. قفل و ارسال‌های قبلی را مستقل بررسی کنید. تأیید ممکن است پول ارسال کند.',
+  'legacy_release': 'تأیید پرداخت قدیمی', 'legacy_refund': 'تأیید بازگشت قدیمی',
+  'legacy_none': 'عملیات قدیمی موجود نیست.', 'legacy_recorded': 'تأیید ثبت شد؛ وضعیت معامله را بررسی کنید.',
+  'admin_check_status': 'ℹ️ p2p #{id}: وضعیت معامله را بررسی کنید؛ پرداخت‌های در انتظار یا نامعلوم نیازمند رسیدگی‌اند.',
+  'result_settled': 'تسویه ثبت شد.', 'result_already_settled': 'قبلاً تسویه ثبت شده.', 'result_invalidated': 'معامله به دلیل تناقض نامعتبر شد.',
+  'result_insufficient_evidence': 'مدرک کافی نیست.', 'result_not_authorized': 'دسترسی ندارید.', 'result_held': 'متوقف یا قبلاً تلاش شده؛ بررسی لازم است.',
+  'admin_panel_btn': '🛡 پنل ادمین',
+  'adm_panel_title': '🛡 پنل ادمین P2P\n\n📊 آمار:',
+  'adm_st_trades': '• معاوضه‌ها: {trades} (تموم‌شده: {done})',
+  'adm_st_users': '• کاربرای معامله‌کننده: {users}',
+  'adm_st_fees': '• کارمزدهای جمع‌شده: {fees} sats',
+  'adm_st_orders': '• سفارش‌های باز بازار: {orders}',
+  'adm_st_disputes': '• اختلاف‌های باز: {disputes}',
+  'adm_st_mod': '• بن‌شده‌ها: {banned} · ادمین‌ها: {admins}',
+  'adm_disputes_btn': '⚖️ اختلاف‌های باز', 'adm_disputes_empty': '✅ اختلاف بازی وجود نداره.',
+  'adm_disputes_title': '⚖️ اختلاف‌های باز ({n}):',
+  'adm_ban_btn': '🚫 بن کاربر', 'adm_banlist_btn': '📜 بن‌شده‌ها',
+  'adm_banlist_title': '🚫 بن‌شده‌ها ({n}):', 'adm_banlist_empty': '🚫 هیچ‌کی بن نشده.',
+  'adm_unban_btn': '♻️ رفع بن {target}', 'adm_unban_notify': '♻️ رفع بن شدی — به بخش P2P خوش برگشتی.',
+  'adm_ban_notify': '🚫 دسترسی‌ات به بخش P2P مسدود شد.',
+  'adm_admins_btn': '👥 ادمین‌های داوری', 'adm_admins_title': '👥 ادمین‌های داوری:',
+  'adm_owner_tag': ' (مالک)', 'adm_add_btn': '➕ افزودن ادمین', 'adm_del_btn': '❌ حذف {target}',
+  'adm_owner_only': '⛔️ فقط مالک', 'adm_owner_only_add': '⛔️ فقط مالک می‌تونه ادمین اضافه کنه.',
+  'adm_add_prompt': '➕ آیدی عددی ادمین جدید رو بفرست:', 'adm_added': '✅ {target} ادمین داوری شد.',
+  'adm_added_notify': '🛡 تو ادمین داوری P2P شدی — گزینه‌ی «🛡 پنل ادمین» تو بخش P2P برات فعاله.',
+  'adm_banned_target': '⛔️ این کاربر بنه — اول رفع بنش کن بعد ادمینش کن.',
+  'adm_ban_prompt': '🚫 آیدی عددی کاربر رو بفرست (دلیل رو هم با فاصله بنویس):\n\nمثال: 123456789 کلاهبردار',
+  'adm_invalid_uid': '⚠️ آیدی عددی معتبر نیست. مثال: 123456789',
+  'adm_ban_self': '😅 خودت رو نمی‌شه بن کرد.',
+  'adm_ban_confirm': '🚫 بن این کاربر رو تأیید می‌کنی؟', 'adm_ban_user': '👤 {target}',
+  'adm_ban_reason': '📝 {reason}', 'adm_ban_yes': '✅ بن کن', 'adm_ban_no': '❌ انصراف',
+  'adm_ban_active': '\n⚠️ معاوضه‌ی فعال داره: #{id} ({stage})',
+  'adm_ban_locking_hint': 'هنوز قفل نشده — می‌تونی لغوش کنی:',
+  'adm_ban_money_hint': 'پول تو بازیه — بعد از بن، از پرونده‌ی اختلاف حلش کن.',
+  'adm_cx_btn': '🗑 لغو معاوضه #{id}',
+  'adm_ban_expired': '⏳ منقضی شد — دوباره از پنل بن کن.',
+  'adm_ban_mismatch': '⛔️ ناسازگار — دوباره از پنل بن کن.',
+  'adm_cx_done': '✅ معاوضه #{id} لغو شد و سفارش برگشت بازار.',
+  'adm_cx_inflight': '⚠️ قفل در جریانه؛ رسیدگی دستی لازم است.',
+  'adm_cx_only_locking': '⚠️ فقط معاوضه‌ی قفل‌نشده از پنل لغو می‌شه؛ پول‌دارها از پرونده‌ی اختلاف.',
+  'adm_case_missing': 'پرونده پیدا نشد.',
+  'adm_case_text': '⚖️ پرونده p2p #{id}{auto}\n\n🛒 خریدار: {buyer}\n\n💸 فروشنده: {seller}\n\n💰 {sats} sats (+{fee} کارمزد)\n🏷 {price}\n📌 مرحله: {stage}{reason}',
+  'adm_case_view_text': '⚖️ پرونده #{id}\n\n🛒 خریدار: {buyer}\n💸 فروشنده: {seller}\n\n💰 {sats} sats (+{fee} کارمزد)\n🏷 {price}\n📌 مرحله: {stage}{reason}\n\n{chat}',
+  'adm_auto': '\n⏰ خودکار', 'adm_reason': '\n📝 {reason}', 'adm_stage_locked': 'قفل',
+  'adm_release_btn': '✅ آزادسازی', 'adm_refund_btn': '↩️ برگشت',
+  'adm_chat_btn': '💬 خلاصه چت', 'adm_chat_full_btn': '💬 چت کامل', 'adm_case_back': '« پرونده',
+  'adm_chat_title': '📋 چت معاوضه #{id} — {n} پیام اخیر:',
+  'adm_chat_empty': '💬 بین طرفین پیامی رد و بدل نشده (یا چت خاموش بوده).',
+  'adm_chat_seller': '💸 فروشنده', 'adm_chat_buyer': '🛒 خریدار',
+  'adm_buyer_unreachable': '⚠️ p2p #{id}: ولت خریدار در دسترس نیست: {err}',
+  'adm_seller_unreachable': '⚠️ p2p #{id}: ولت فروشنده در دسترس نیست: {err}',
+  'adm_payout_failed': '⚠️ p2p #{id}: پرداخت ادمین ناموفق بود ({err})',
+  'adm_refund_failed': '⚠️ p2p #{id}: بازگشت وجه ناموفق بود ({err})',
+  'adm_alert_event': '⚠️ p2p: رویداد اسکرو #{event_id} {direction} {amount} {status} برای بررسی متوقف شد؛ انتساب یا بازگشت خودکار انجام نمی‌شود',
+  'trade_notice_payout': 'معامله #{id}: پرداخت با بررسی مدیر ثبت شد.',
+  'trade_notice_refund': 'معامله #{id}: بازگشت وجه با بررسی مدیر ثبت شد.',
+  'trade_notice_invalidated': 'معامله #{id}: مدارک متناقض است؛ نتیجه نامعتبر و نیازمند بررسی است. پرداخت قبلی قابل برگشت خودکار نیست.',
 
 
   'home_title': '🤝 معاوضه ساتوشی',
@@ -397,6 +525,10 @@ TXT = {
   'ping_release': '🎉 فروشنده آزاد کرد! ساتوشی‌ها داره میره ولتت.',
   'cx_solo': '⛔️ معاوضه لغو شد (قبل از قفل — هیچ پولی قفل نبود). سفارش هم از بازار برداشته شد.',
   'busy_locking': '⏳ دارم قفل می‌کنم… یه چند ثانیه صبر کن.',
+  'lock_held': '⚠️ نتیجه قفل مشخص نیست یا مهلتش تمام شده؛ دوباره پرداخت نکن. ممکن است دارایی گیر کند و ابزار بررسی امن هنوز آماده نیست. با ادمین تماس بگیر.',
+  'lock_amount_note': '🔐 مبلغ دقیق قفل: {amt} ساتوشی (مقدار + کارمزد + شناسه یکتا)؛ فقط و دقیقاً همین مبلغ قفل می‌شود.',
+  'adm_lock_auto': '✅ p2p: قفل معامله #{id} با مبلغ یکتای {amount} ساتوشی به‌صورت خودکار تأیید شد.',
+  'fiat_timeout_dispute': '⚖️ مهلت تأیید واریز گذشته؛ پرونده برای بررسی به ادمین رفت. پول خودکار برگشت نمی‌خورد.',
   'busy_fiating': '⏳ ثبت «واریز کردم»…',
   'room_close': '🗑 بستن اتاق معامله',
   'room_closed': '🗑 اتاق معاوضه بسته شد. ساتوشی‌ها تو ولتته — برای معامله بعدی «🤝 P2P» رو بزن.',
@@ -420,7 +552,6 @@ TXT = {
   'fixed_resolved': '✅ ثبت شد: {sats} sats در برابر {fiat} تومان ({prem}%)',
   'wiz_sats_price': '🪙 چند ساتوشی می‌خوای در برابر این مبلغ بفروشی؟\n\nفقط عدد بفرست. مثال: 50000',
   'wiz_bad_sats': '⚠️ عدد معتبر نیست. فقط عدد ساتوشی بفرست. مثال: 50000',
-  'ch_join': '📢 کانال سفارش‌ها',
   'fiat_hint': '💱 ارز معامله از ⚙️ تنظیمات ← «ارز مبدا» قابل تغییره',
   'own_order_note': '📌 این سفارش مال خودته — از «🧾 سفارش‌های من» مدیریتش کن.',
   'fee_short': 'کارمزد',
@@ -464,8 +595,123 @@ TXT = {
   'price_l': '🏷 قیمت',
   'amount_l': '💰 مقدار',
   'st_canceled': '⛔️ این معاوضه لغو شد.',
+  # ---- item 23 migrations (fa = today's fa bytes; en follows decision #8) ----
+  'timer_lock_wait': '⏱ مهلت قفل ساتوشی: {m} دقیقه و {s} ثانیه باقی‌مانده',
+  'timer_lock_expired': '⏰ مهلت قفل تمام شده',
+  'timer_locked': '⏱ زمان گذشته از قفل: {em} دقیقه | مهلت واریز خریدار: {rm} دقیقه باقی‌مانده',
+  'timer_locked_over': '⏰ مهلت گذشته ({em} دقیقه) — فروشنده می‌تواند درخواست بررسی اختلاف بدهد؛ بازگشت خودکار نیست',
+  'timer_fiat': '⏱ زمان گذشته از واریز: {eh} ساعت | مهلت آزادسازی فروشنده: {rh} ساعت باقی‌مانده',
+  'card_sell': '💸 فروش ساتوشی',
+  'card_buy': '🛒 خرید ساتوشی',
+  'rate_market': '📈 قیمت بازار ({src_name}){prem_tag}',
+  'amount_sats': '🪙 {amount} ساتوشی',
+  'amount_fiat': '💵 {amount} {fiat} {flag}',
+  'chat_relay_msg': '💬 #{tid}\n{text}',
+  'msg_sent': '✅ ارسال شد',
+  'msg_fail': '⚠️ ارسال نشد — دوباره امتحان کن',
+  'rate_saved': '⭐ ثبت شد',
+  'username_nudge': '⚠️ برای استفاده از بخش P2P یه یوزرنیم تلگرام ست کن (تنظیمات تلگرام → Username).',
+  'banned_answer': '🚫 دسترسی‌ات به P2P مسدود شده.',
+  'testing_answer': '⚠️ P2P در حال تست است.',
+  'expired_channel': '⏳ منقضی شد',
+  'expired_notify': '⏳ سفارش #{id} مهلتش تموم شد و از بازار برداشته شد.',
+  'refunded_channel': '↩️ برگشت خورد',
+  'p2p_btn_active': '({n} در جریان)',
+  'ttl_ask': '⏳ سفارش تا کی تو بازار بمونه؟',
+  'ttl_12h': '12 ساعت',
+  'ttl_24h': '24 ساعت',
+  'ttl_2d': '2 روز',
+  'ttl_line': '\n⏳ مهلت: {label}',
+  # ---- UI/UX pass: card/room literals moved into the pack ----
+  'timer_fiat_over': '⏰ مهلت آزادسازی گذشته ({eh} ساعت) — ساتوشی‌ها رو آزاد کن یا درخواست بررسی اختلاف بده',
+  'fixed_price_line': '🏷 به قیمت {price} {fiat}',
+  'mf_all': 'همه', 'mf_sell': '💸 فروش', 'mf_buy': '🛒 خرید',
+  'card_own': '📌 این سفارش مال خودته',
+  'take_sell_order': '🛒 خرید ساتوشی', 'take_buy_order': '💸 فروش ساتوشی',
+  'stats_word': 'معامله',
+  'stats_hist': '👤 کاربر در {days} روز {trades} معامله موفق داشته',
+  'prem_custom': '✍️ دستی',
+  'deal_sell_for': 'فروش به اندازه\n{amt}',
+  'deal_buy_for': 'خرید به اندازه\n{amt}',
+  'rate_line': '📈 نرخ: {src}{ptag}',
  },
  'en': {
+  'holds_title': 'Held operations: investigate authoritative wallet records. Never resend unknown outcomes.',
+  'events_title': 'Unattributed or conflicting events. Review records only; no funds will move.',
+  'event_missing': 'Event not found.', 'event_detail': 'Event #{id}\nPayment ID: {pid}\n{direction} {amount} · {status}\nConflict: {conflict}\nObservations:\n{evidence}\nReview: {review}\nIdentity is not proven. Reviewing does not attribute or move funds.',
+  'not_reviewed': 'not reviewed', 'record_evidence': 'Record evidence', 'events_back': '« Events',
+  'event_review_prompt': 'Send an evidence note (no secrets). This records a review only; no attribution or payment.',
+  'event_review_saved': 'Evidence recorded. Event remains unassigned; no funds moved.',
+  'event_review_failed': 'Review not recorded: missing note, already reviewed, or unauthorized.',
+  'holds_panel': 'Held operations', 'events_panel': 'Review escrow events',
+  'next': 'Next', 'admin_back': '« Admin', 'holds_back': '« Holds', 'cancel_admin': 'Cancel',
+  'admin_only': 'Admins only', 'trade_missing': 'Trade not found.', 'unknown': 'unknown',
+  'hold_detail': 'Trade #{id} · {stage}\nBuyer: {buyer} · Seller: {seller}\nLock ID: {lock}\nPayout ID: {payout}\nRefund ID: {refund}\nFee: {fee} · Attempts: {tries} · Fee ID: {fee_id}\nHold unknown outcomes. A missing ID is not proof of non-payment.',
+  'send_fee': 'Send fee (one attempt)',
+  'confirm_fee_text': 'Confirm ONE fee send of {fee} sats to the owner. Unknown outcomes cannot be retried.',
+  'confirm_fee': 'Confirm fee send', 'confirmation_invalid': 'Confirmation invalid or expired.',
+  'legacy_warning': 'Legacy trade: independently verify the lock and prior sends. Confirming may send money.',
+  'legacy_release': 'Acknowledge legacy payout', 'legacy_refund': 'Acknowledge legacy refund',
+  'legacy_none': 'No legacy action available.', 'legacy_recorded': 'Acknowledgement recorded; check the trade status.',
+  'admin_check_status': 'ℹ️ p2p #{id}: check the trade status; pending or uncertain payments require reconciliation.',
+  'result_settled': 'Settlement recorded.', 'result_already_settled': 'Already settled.', 'result_invalidated': 'Trade invalidated by conflicting evidence.',
+  'result_insufficient_evidence': 'Insufficient evidence.', 'result_not_authorized': 'Not authorized.', 'result_held': 'Held or already attempted; investigation required.',
+  'admin_panel_btn': '🛡 Admin panel',
+  'adm_panel_title': '🛡 P2P admin panel\n\n📊 Stats:',
+  'adm_st_trades': '• Trades: {trades} (completed: {done})',
+  'adm_st_users': '• Trading users: {users}',
+  'adm_st_fees': '• Collected fees: {fees} sats',
+  'adm_st_orders': '• Open market orders: {orders}',
+  'adm_st_disputes': '• Open disputes: {disputes}',
+  'adm_st_mod': '• Banned: {banned} · Admins: {admins}',
+  'adm_disputes_btn': '⚖️ Open disputes', 'adm_disputes_empty': '✅ No open disputes.',
+  'adm_disputes_title': '⚖️ Open disputes ({n}):',
+  'adm_ban_btn': '🚫 Ban user', 'adm_banlist_btn': '📜 Banned',
+  'adm_banlist_title': '🚫 Banned ({n}):', 'adm_banlist_empty': '🚫 Nobody is banned.',
+  'adm_unban_btn': '♻️ Unban {target}', 'adm_unban_notify': '♻️ You have been unbanned — welcome back to P2P.',
+  'adm_ban_notify': '🚫 Your access to the P2P section has been blocked.',
+  'adm_admins_btn': '👥 Adjudication admins', 'adm_admins_title': '👥 Adjudication admins:',
+  'adm_owner_tag': ' (owner)', 'adm_add_btn': '➕ Add admin', 'adm_del_btn': '❌ Remove {target}',
+  'adm_owner_only': '⛔️ Owner only', 'adm_owner_only_add': '⛔️ Only the owner can add admins.',
+  'adm_add_prompt': '➕ Send the numeric ID of the new admin:', 'adm_added': '✅ {target} is now an adjudication admin.',
+  'adm_added_notify': '🛡 You are now a P2P adjudication admin — the «🛡 Admin panel» option in the P2P section is enabled for you.',
+  'adm_banned_target': '⛔️ This user is banned — unban first, then promote.',
+  'adm_ban_prompt': '🚫 Send the user\'s numeric ID (add a reason after a space):\n\nExample: 123456789 scammer',
+  'adm_invalid_uid': '⚠️ Not a valid numeric ID. Example: 123456789',
+  'adm_ban_self': '😅 You cannot ban yourself.',
+  'adm_ban_confirm': '🚫 Confirm banning this user?', 'adm_ban_user': '👤 {target}',
+  'adm_ban_reason': '📝 {reason}', 'adm_ban_yes': '✅ Ban', 'adm_ban_no': '❌ Cancel',
+  'adm_ban_active': '\n⚠️ Has an active trade: #{id} ({stage})',
+  'adm_ban_locking_hint': 'Not locked yet — you can cancel it:',
+  'adm_ban_money_hint': 'Funds are in play — after banning, resolve it from the dispute case.',
+  'adm_cx_btn': '🗑 Cancel trade #{id}',
+  'adm_ban_expired': '⏳ Expired — ban again from the panel.',
+  'adm_ban_mismatch': '⛔️ Mismatch — ban again from the panel.',
+  'adm_cx_done': '✅ Trade #{id} canceled and the order returned to the market.',
+  'adm_cx_inflight': '⚠️ Lock in progress; manual reconciliation required.',
+  'adm_cx_only_locking': '⚠️ Only unlocked trades can be canceled from the panel; funded ones go through the dispute case.',
+  'adm_case_missing': 'Case not found.',
+  'adm_case_text': '⚖️ p2p case #{id}{auto}\n\n🛒 Buyer: {buyer}\n\n💸 Seller: {seller}\n\n💰 {sats} sats (+{fee} fee)\n🏷 {price}\n📌 Stage: {stage}{reason}',
+  'adm_case_view_text': '⚖️ Case #{id}\n\n🛒 Buyer: {buyer}\n💸 Seller: {seller}\n\n💰 {sats} sats (+{fee} fee)\n🏷 {price}\n📌 Stage: {stage}{reason}\n\n{chat}',
+  'adm_auto': '\n⏰ automatic', 'adm_reason': '\n📝 {reason}', 'adm_stage_locked': 'locked',
+  'adm_release_btn': '✅ Release', 'adm_refund_btn': '↩️ Refund',
+  'adm_chat_btn': '💬 Chat summary', 'adm_chat_full_btn': '💬 Full chat', 'adm_case_back': '« Case',
+  'adm_chat_title': '📋 Trade #{id} chat — {n} recent messages:',
+  'adm_chat_empty': '💬 No messages were exchanged (or chat was off).',
+  'adm_chat_seller': '💸 Seller', 'adm_chat_buyer': '🛒 Buyer',
+  'adm_buyer_unreachable': '⚠️ p2p #{id}: buyer wallet unreachable: {err}',
+  'adm_seller_unreachable': '⚠️ p2p #{id}: seller wallet unreachable: {err}',
+  'adm_payout_failed': '⚠️ p2p #{id}: admin payout failed ({err})',
+  'adm_refund_failed': '⚠️ p2p #{id}: refund failed ({err})',
+  'adm_alert_event': '⚠️ p2p: escrow event #{event_id} {direction} {amount} {status} held for review; no automatic attribution or refund',
+  'mark_settled_payout': 'Mark payout settled (requires evidence)',
+  'mark_settled_refund': 'Mark refund settled (requires evidence)',
+  'mark_settled_fee': 'Mark fee settled (requires evidence)',
+  'hold_conflict_title': '\n⚠️ Conflicting evidence:\n{lines}',
+  'hold_open_case': '⚖️ Dispute case',
+  'trade_notice_payout': 'Trade #{id}: payout settlement recorded by an administrator.',
+  'trade_notice_refund': 'Trade #{id}: refund settlement recorded by an administrator.',
+  'trade_notice_invalidated': 'Trade #{id}: conflicting evidence invalidated the outcome; investigation required. A prior payment cannot be automatically reversed.',
   'home_title': '🤝 P2P Exchange',
   'home_body': 'Trade your sats directly with people.\nThe bot only holds the funds; both sides set the price.',
   'home_fee': '💸 Fee: 0.5% from the seller',
@@ -533,6 +779,10 @@ TXT = {
   'ping_release': '🎉 The seller released! Sats are on the way to your wallet.',
   'cx_solo': '⛔️ Trade canceled (pre-lock — no sats were held). The order was removed from the market.',
   'busy_locking': '⏳ Locking… hang on a few seconds.',
+  'lock_held': '⚠️ Lock outcome unknown or deadline passed. Do not pay again; funds may remain stuck because safe reconciliation is not yet available. Contact an admin.',
+  'lock_amount_note': '🔐 Exact lock amount: {amt} sats (amount + fee + unique tag); exactly this amount will be locked.',
+  'adm_lock_auto': '✅ p2p: trade #{id} lock auto-verified by its unique amount of {amount} sats.',
+  'fiat_timeout_dispute': '⚖️ Fiat confirmation timed out. The case was sent to an admin; there is no automatic refund.',
   'busy_fiating': '⏳ Confirming payment…',
   'room_close': '🗑 Close trade room',
   'room_closed': '🗑 Trade room closed. Your sats are in your wallet — tap "🤝 P2P" for the next trade.',
@@ -554,7 +804,6 @@ TXT = {
   'fixed_resolved': '✅ Set: {sats} sats for {fiat} ({prem}%)',
   'wiz_sats_price': '🪙 How many sats do you want for this amount?\n\nSend just the number. Example: 50000',
   'wiz_bad_sats': '⚠️ Not a valid number. Send the sats amount only. Example: 50000',
-  'ch_join': '📢 Orders channel',
   'fiat_hint': '💱 Change the trade currency in ⚙️ Settings',
   'own_order_note': '📌 This is your own order — manage it from “My orders”.',
   'fee_short': 'fee',
@@ -598,6 +847,46 @@ TXT = {
   'price_l': '🏷 Price',
   'amount_l': '💰 Amount',
   'st_canceled': '⛔️ Trade canceled.',
+  # ---- item 23 migrations (single-literal sites: same bytes in both packs) ----
+  'timer_lock_wait': '⏱ Lock timeout: {m}m {s}s remaining',
+  'timer_lock_expired': '⏰ Lock timeout expired',
+  'timer_locked': '⏱ Locked {em}m ago | Buyer fiat timeout in {rm}m',
+  'timer_locked_over': '⏰ Deadline passed ({em}m) — seller may request a dispute; no automatic refund',
+  'timer_fiat': '⏱ Time since fiat: {eh}h | Release timeout in {rh}h',
+  'card_sell': '💸 Selling sats',
+  'card_buy': '🛒 Buying sats',
+  'rate_market': '📈 Market rate ({src_name}){prem_tag}',
+  'amount_sats': '🪙 {amount} sats',
+  'amount_fiat': '💵 {amount} {fiat} {flag}',
+  'chat_relay_msg': '💬 #{tid}\n{text}',
+  # item 23 migrations — en wording restored in the UI/UX pass (decision #8 lifted)
+  'msg_sent': '✅ Sent',
+  'msg_fail': '⚠️ Could not send — try again',
+  'rate_saved': '⭐ Saved',
+  'username_nudge': '⚠️ Set a Telegram username to use P2P (Telegram Settings → Username).',
+  'banned_answer': '🚫 Your access to P2P is banned.',
+  'testing_answer': '⚠️ P2P is in testing mode.',
+  'expired_channel': '⏳ Expired',
+  'expired_notify': '⏳ Order #{id} timed out and was removed from the market.',
+  'refunded_channel': '↩️ Refunded',
+  'p2p_btn_active': '({n} active)',
+  'ttl_ask': '⏳ How long should the order stay on the market?',
+  'ttl_12h': '12h',
+  'ttl_24h': '24h',
+  'ttl_2d': '2 days',
+  'ttl_line': '\n⏳ Expires in: {label}',
+  # ---- UI/UX pass: card/room literals moved into the pack ----
+  'timer_fiat_over': '⏰ Release deadline passed ({eh}h) — release the sats or open a dispute',
+  'fixed_price_line': '🏷 At {price} {fiat}',
+  'mf_all': 'All', 'mf_sell': '💸 Sell', 'mf_buy': '🛒 Buy',
+  'card_own': '📌 This is your own order',
+  'take_sell_order': '🛒 Buy sats', 'take_buy_order': '💸 Sell sats',
+  'stats_word': 'trades',
+  'stats_hist': '👤 {trades} successful trades in {days} days',
+  'prem_custom': '✍️ Custom',
+  'deal_sell_for': 'Selling for\n{amt}',
+  'deal_buy_for': 'Buying for\n{amt}',
+  'rate_line': '📈 Rate: {src}{ptag}',
  },
 }
 
@@ -652,14 +941,20 @@ def side_word(uid, side):
 
 # ==================== escrow wallet ====================
 
+def _payment_is_sats(payment):
+    # Generic amount also represents token base units; token/unknown must not
+    # be processed as satoshi escrow payments.
+    method = str(getattr(payment, 'method', '')).upper()
+    return any(name in method for name in ('SPARK', 'LIGHTNING', 'DEPOSIT', 'WITHDRAW')) and 'TOKEN' not in method and 'TOKEN' not in type(getattr(payment, 'details', None)).__name__.upper()
+
+
 class EscrowListener(EventListener):
     """Escrow wallet's own SDK listener — PAYMENT_SUCCEEDED (RECEIVE) = a lock
     landed; (SEND) = a payout/refund finished."""
 
     async def on_event(self, event):
         try:
-            b = _bot()
-            if 'PAYMENT_SUCCEEDED' not in type(event).__name__:
+            if not any(name in type(event).__name__ for name in ('PAYMENT_SUCCEEDED', 'PAYMENT_PENDING', 'PAYMENT_FAILED')):
                 return
             payment = getattr(event, 'payment', None)
             if payment is None:
@@ -668,11 +963,15 @@ class EscrowListener(EventListener):
             amount = getattr(payment, 'amount_sats', getattr(payment, 'amount', 0)) or 0
             pid = getattr(payment, 'id', '')
             status = str(getattr(payment, 'status', ''))
+            if not _payment_is_sats(payment):
+                return
             logging.info(f'p2p escrow event: {type(event).__name__} {ptype} {amount}s {status}')
-            fut = asyncio.run_coroutine_threadsafe(
-                on_escrow_payment(str(ptype), amount, pid, status),
+            # Persist before scheduling: an early event must survive a restart.
+            event_id, changed = record_escrow_event(str(ptype), amount, pid, status)
+            b = _bot()
+            asyncio.run_coroutine_threadsafe(
+                on_escrow_payment(str(ptype), amount, pid, status, (event_id, changed)),
                 b.main_event_loop)
-            fut.result(timeout=30)
         except Exception as e:
             logging.error(f'p2p escrow listener error: {e}')
 
@@ -724,23 +1023,34 @@ async def spark_address_of(uid):
     return addr
 
 
-async def send_sats_from_escrow(dest_address, sats, log_tag):
+async def send_sats_from_escrow(dest_address, sats, log_tag, gate=None):
     """Zero-fee internal spark send from the escrow wallet. Returns (ok, payment_id, err).
-    Runs off-loop — a slow send must never freeze buttons/chat."""
+    Runs off-loop — a slow send must never freeze buttons/chat.
+    ``gate``: optional callable returning False to abort right before the SDK send
+    (e.g. trade invalidated by a conflicting event during preparation)."""
     async def _impl():
         b = _bot()
         sdk = await escrow_sdk()
         prep = await sdk.prepare_send_payment(request=b.PrepareSendPaymentRequest(
             payment_request=b.PaymentRequest.INPUT(input=dest_address),
             amount=int(sats)))
+        try:
+            if gate is not None and not gate():
+                logging.warning(f'p2p escrow send [{log_tag}]: aborted by gate before send')
+                return False, '', 'held: invalidated before send'
+        except Exception as gate_err:
+            logging.error(f'p2p escrow send [{log_tag}] gate check failed: {gate_err}')
+            return False, '', 'held: gate check failed'
         resp = await sdk.send_payment(request=b.SendPaymentRequest(prepare_response=prep))
         payment = getattr(resp, 'payment', None)
         pid = getattr(payment, 'id', '') or ''
         status = str(getattr(payment, 'status', ''))
         logging.info(f'p2p escrow send [{log_tag}]: {sats}s -> {status} ({pid})')
-        if 'COMPLETED' in status:
+        if _event_value(status) == 'COMPLETED':
             return True, pid, None
-        return 'PENDING' in status, pid, None if 'PENDING' in status else status
+        if _event_value(status) == 'PENDING':
+            return 'PENDING', pid, None
+        return False, pid, status
     try:
         return await offloop(_impl())
     except Exception as e:
@@ -749,103 +1059,536 @@ async def send_sats_from_escrow(dest_address, sats, log_tag):
 
 
 async def sweep_fee_to_owner(trade):
-    """0.5% fee: escrow sends the fee straight to the owner's wallet via a
-    zero-fee SPARK address send (same zap method the bot uses for fee sweeps —
-    no invoice, no LN routing)."""
-    b = _bot()
-    owner = admin_id()
-    if not owner or trade['fee_paid']:
-        return
-    try:
-        async def _impl():
-            owner_sdk = await b.get_wallet(owner)
-            addr_resp = await owner_sdk.receive_payment(request=b.ReceivePaymentRequest(
-                payment_method=b.ReceivePaymentMethod.SPARK_ADDRESS()))
-            owner_address = addr_resp.payment_request
-            sdk = await escrow_sdk()
-            preped = await sdk.prepare_send_payment(request=b.PrepareSendPaymentRequest(
-                payment_request=b.PaymentRequest.INPUT(input=owner_address),
-                amount=int(trade['fee'])))
-            resp = await sdk.send_payment(request=b.SendPaymentRequest(
-                prepare_response=preped))
-            return str(getattr(getattr(resp, 'payment', None), 'status', ''))
-        status = await offloop(_impl())
-        if 'COMPLETED' in status or 'PENDING' in status:
-            _exec('UPDATE trades SET fee_paid=1 WHERE id=?', (trade['id'],))
-            logging.info(f'p2p fee swept via spark for trade #{trade["id"]}: '
-                         f'{trade["fee"]}s ({status})')
-            try:
-                await b.client.send_message(
-                    owner,
-                    f'💰 **کارمزد P2P دریافت شد**\n\n'
-                    f'💵 {trade["fee"]:,} sats\n'
-                    f'🤝 معاوضه #{trade["id"]}')
-            except Exception as ne:
-                logging.error(f'p2p fee notify failed: {ne}')
-        else:
-            raise RuntimeError(f'fee spark send status: {status}')
-    except Exception as e:
-        tries = (trade.get('fee_tries') or 0) + 1
-        _exec('UPDATE trades SET fee_tries=? WHERE id=?', (tries, trade['id']))
-        logging.error(f'p2p fee sweep failed (try {tries}) trade #{trade["id"]}: {e}')
+    # shortcut: fee sends disabled until durable attribution and recovery are proven.
+    return
 
 
 # ==================== escrow reconciliation ====================
 
-async def on_escrow_payment(ptype, amount, pid, status):
-    """Called from the escrow listener (and the startup scan)."""
-    if 'RECEIVE' in ptype:
-        row = _one("SELECT * FROM trades WHERE stage=? ORDER BY created ASC", (ST_LOCKING,))
-        if row and amount and amount == row['sats'] + row['fee']:
-            await mark_locked(row['id'])
-        elif row:
-            logging.info(f'p2p escrow RECEIVE {amount}s matches no pending lock '
-                         f'(want {row["sats"] + row["fee"]}s) — ignored')
-    elif 'SEND' in ptype:
-        for col, done_stage, apply in (
-                ('payout_id', ST_PAYOUT, 'payout'),
-                ('refund_id', ST_REFUND, 'refund')):
-            row = _one(f'SELECT * FROM trades WHERE {col}=? AND stage IN (?,?)',
-                       (pid, ST_PAYOUT if col == 'payout_id' else ST_REFUND,
-                        ST_PAYOUT if col == 'payout_id' else ST_REFUND))
-            if row:
-                if 'COMPLETED' in status:
-                    if apply == 'payout':
-                        await finish_payout(row['id'])
+def _match_lock_trade(amount, pid):
+    # SDK payment IDs are documented as wallet payment IDs, not as a shared
+    # sender/receiver transfer identity. Even an equal ID is not proof of origin.
+    return None
+
+
+async def _refund_stray_lock(row, amount, pid):
+    # Attribution of an incoming Spark address payment is unproven. Never send
+    # a guessed refund from the shared wallet; hold for manual investigation.
+    await notify(_bot().client, admin_id(),
+                 f'⚠️ p2p: unverified escrow receive {pid} ({amount} sats); manual resolution required')
+
+
+async def _handle_escrow_receive(amount, pid):
+    logging.warning(f'p2p escrow receive {pid} ({amount}s): identity unverified; held')
+    await notify(_bot().client, admin_id(),
+                 f'⚠️ p2p: escrow received {amount} sats ({pid}); sender identity unverified — manual resolution required')
+
+
+def _event_value(value):
+    return str(value or '').upper().rsplit('.', 1)[-1]
+
+
+def _queue_trade_notices(db, tid, kind):
+    for target in ('buyer', 'seller', 'room', 'channel', 'admin'):
+        db.execute('INSERT OR IGNORE INTO escrow_trade_notices(trade_id,kind,target) VALUES (?,?,?)', (tid, kind, target))
+
+
+def _invalidate_event_trades(db, event_id):
+    rows = db.execute("SELECT DISTINCT t.id FROM trades t JOIN escrow_events e ON e.id=? LEFT JOIN escrow_adjudications a ON a.trade_id=t.id AND a.event_id=e.id LEFT JOIN escrow_fee_attempts f ON f.trade_id=t.id AND f.payment_id=e.payment_id WHERE t.stage IN (?,?) AND (a.event_id IS NOT NULL OR t.payout_id=e.payment_id OR t.refund_id=e.payment_id OR f.payment_id IS NOT NULL)", (event_id, ST_DONE, ST_REFUNDED)).fetchall()
+    for row in rows:
+        db.execute('UPDATE trades SET stage=?,fee_safe=0,updated=? WHERE id=?', (ST_INVALIDATED, time.time(), row['id']))
+        _queue_trade_notices(db, row['id'], 'invalidated')
+
+
+def record_escrow_event(ptype, amount, pid, status):
+    """Store every distinct observation; unknown IDs never match a trade."""
+    direction, status = _event_value(ptype), _event_value(status)
+    pid = pid if isinstance(pid, str) and pid.strip() else None
+    amount = str(amount)
+    now = time.time()
+    with _db_lock:
+        db = _connect()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            previous = db.execute('SELECT * FROM escrow_events WHERE payment_id=?', (pid,)).fetchone() if pid else None
+            if previous is None:
+                cur = db.execute('INSERT INTO escrow_events (payment_id,direction,amount,status,conflict,first_seen,last_seen) VALUES (?,?,?,?,?,?,?)',
+                                 (pid, direction, amount, status, int(pid is None), now, now))
+                event_id, changed = cur.lastrowid, True
+            else:
+                conflict = (previous['direction'] != direction or previous['amount'] != amount or
+                            (previous['status'] in ('COMPLETED', 'FAILED') and status in ('COMPLETED', 'FAILED') and previous['status'] != status))
+                new_status = previous['status'] if previous['status'] in ('COMPLETED', 'FAILED') else status
+                db.execute('UPDATE escrow_events SET status=?, conflict=MAX(conflict,?), last_seen=? WHERE id=?',
+                           (new_status, int(conflict), now, previous['id']))
+                event_id, changed = previous['id'], bool(conflict and not previous['conflict'])
+            observation = db.execute('INSERT OR IGNORE INTO escrow_observations (event_id,direction,amount,status,observed_at) VALUES (?,?,?,?,?)',
+                                     (event_id, direction, amount, status, now))
+            event = db.execute('SELECT * FROM escrow_events WHERE id=?', (event_id,)).fetchone()
+            if observation.rowcount and previous is not None:
+                db.execute('UPDATE escrow_events SET reviewed_by=NULL, reviewed_at=NULL, review_note=NULL WHERE id=?', (event_id,))
+            if observation.rowcount and (direction == 'RECEIVE' or status == 'FAILED' or event['conflict'] or pid is None):
+                db.execute('INSERT OR IGNORE INTO escrow_alerts(event_id,direction,amount,status) VALUES (?,?,?,?)', (event_id, direction, amount, status))
+            if event['conflict'] and pid:
+                db.execute('UPDATE trades SET fee_safe=0 WHERE payout_id=?', (pid,))
+                _invalidate_event_trades(db, event_id)
+            db.commit()
+            return event_id, changed
+        except Exception:
+            db.rollback()
+            raise
+
+
+def review_escrow_event(uid, event_id, note):
+    """Record human evidence only; retain every superseded review."""
+    if not is_p2p_admin(uid) or not isinstance(note, str) or not note.strip() or len(note) > 1000:
+        return False
+    with _db_lock:
+        db = _connect()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            now = time.time()
+            cur = db.execute('UPDATE escrow_events SET reviewed_by=?, reviewed_at=?, review_note=? WHERE id=? AND reviewed_by IS NULL', (uid, now, note.strip(), event_id))
+            if cur.rowcount:
+                db.execute('INSERT INTO escrow_reviews(event_id,uid,reviewed_at,note) VALUES (?,?,?,?)', (event_id, uid, now, note.strip()))
+            db.commit()
+            return cur.rowcount == 1
+        except Exception:
+            db.rollback()
+            raise
+
+
+def issue_escrow_confirmation(uid, tid, action):
+    nonce = secrets.token_urlsafe(12)
+    _exec('INSERT INTO escrow_confirmations(nonce,uid,trade_id,action,expires) VALUES (?,?,?,?,?)',
+          (nonce, uid, tid, action, time.time() + 300))
+    return nonce
+
+
+def consume_escrow_confirmation(uid, tid, action, nonce):
+    if not nonce or not is_p2p_admin(uid):
+        return False
+    return _exec('UPDATE escrow_confirmations SET consumed_at=? WHERE nonce=? AND uid=? AND trade_id=? AND action=? AND consumed_at IS NULL AND expires>?',
+                 (time.time(), nonce, uid, tid, action, time.time())).rowcount == 1
+
+
+def admin_adjudicate(uid, tid, kind):
+    """An explicit human decision on a bound, conflict-free observation; never sends."""
+    if not is_p2p_admin(uid) or kind not in ('payout', 'refund', 'fee'):
+        return 'not authorized'
+    with _db_lock:
+        db = _connect()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            previous = db.execute('SELECT 1 FROM escrow_adjudications WHERE trade_id=? AND kind=?', (tid, kind)).fetchone()
+            if previous:
+                tr_previous = db.execute('SELECT stage FROM trades WHERE id=?', (tid,)).fetchone()
+                db.commit()
+                return 'invalidated' if tr_previous and tr_previous['stage'] == ST_INVALIDATED else 'already settled'
+            tr = db.execute('SELECT * FROM trades WHERE id=?', (tid,)).fetchone()
+            if not tr:
+                db.commit()
+                return 'insufficient evidence'
+            if kind == 'fee':
+                attempt = db.execute('SELECT * FROM escrow_fee_attempts WHERE trade_id=?', (tid,)).fetchone()
+                valid = tr['stage'] == ST_DONE and not tr['fee_paid'] and attempt and attempt['amount'] == tr['fee']
+                pid = attempt['payment_id'] if attempt else None
+                amount = tr['fee']
+            else:
+                valid = tr['stage'] in ((ST_PAYOUT, ST_DONE) if kind == 'payout' else (ST_REFUND,))
+                pid = tr['payout_id'] if kind == 'payout' else tr['refund_id']
+                amount = payout_amount_of(tr) if kind == 'payout' else refund_amount_of(tr)
+            event = db.execute('SELECT * FROM escrow_events WHERE payment_id=?', (pid,)).fetchone() if pid else None
+            count = db.execute('SELECT (SELECT COUNT(*) FROM trades WHERE payout_id=?) + (SELECT COUNT(*) FROM trades WHERE refund_id=?) + (SELECT COUNT(*) FROM escrow_fee_attempts WHERE payment_id=?)', (pid, pid, pid)).fetchone()[0] if pid else 0
+            observation = db.execute("SELECT 1 FROM escrow_observations WHERE event_id=? AND direction='SEND' AND amount=? AND status='COMPLETED'", (event['id'], str(amount))).fetchone() if event else None
+            if not (valid and isinstance(pid, str) and pid.strip() and count == 1 and event and not event['conflict'] and event['direction'] == 'SEND' and event['amount'] == str(amount) and event['status'] == 'COMPLETED' and observation):
+                db.commit()
+                return 'insufficient evidence'
+            now = time.time()
+            db.execute('INSERT INTO escrow_adjudications(trade_id,kind,event_id,payment_id,direction,amount,status,admin_uid,adjudicated_at) VALUES (?,?,?,?,?,?,?,?,?)', (tid, kind, event['id'], pid, 'SEND', str(amount), 'COMPLETED', uid, now))
+            if kind == 'fee':
+                db.execute('UPDATE trades SET fee_paid=1,updated=? WHERE id=?', (now, tid))
+            else:
+                db.execute('UPDATE trades SET stage=?,updated=?,cancel_seller=0,cancel_buyer=0 WHERE id=?', (ST_DONE if kind == 'payout' else ST_REFUNDED, now, tid))
+                _queue_trade_notices(db, tid, kind)
+            db.commit()
+            return 'settled'
+        except sqlite3.IntegrityError:
+            db.rollback()
+            return 'insufficient evidence'
+        except Exception:
+            db.rollback()
+            raise
+
+
+def _fee_send_still_valid(tid):
+    """Gate checked immediately before the SDK fee send: the trade must still be
+    done, un-conflicted and hold an unbound fee attempt."""
+    try:
+        with _db_lock:
+            db = _connect()
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                tr = db.execute('SELECT * FROM trades WHERE id=?', (tid,)).fetchone()
+                attempt = db.execute('SELECT 1 FROM escrow_fee_attempts WHERE trade_id=? AND payment_id IS NULL', (tid,)).fetchone()
+                conflict = db.execute('SELECT 1 FROM escrow_events WHERE payment_id=? AND conflict=1', (tr['payout_id'],)).fetchone() if tr and tr['payout_id'] else None
+                ok = bool(tr and tr['stage'] == ST_DONE and attempt and not conflict and not tr['fee_paid'])
+                db.commit()
+                return ok
+            except Exception:
+                db.rollback()
+                raise
+    except Exception as e:
+        logging.error(f'p2p fee gate check failed for trade {tid}: {e}')
+        return False
+
+
+def _bind_fee_payment(tid, pid):
+    """Bind the fee payment ID; reconcile already-journaled conflicts at bind time
+    (events may have arrived between the send and this binding)."""
+    with _db_lock:
+        db = _connect()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            db.execute('UPDATE escrow_fee_attempts SET payment_id=?,bound_at=? WHERE trade_id=? AND payment_id IS NULL',
+                       (pid, time.time(), tid))
+            ev = db.execute('SELECT * FROM escrow_events WHERE payment_id=?', (pid,)).fetchone()
+            if ev and ev['conflict']:
+                db.execute('UPDATE trades SET stage=?,fee_safe=0,updated=? WHERE id=? AND stage=?',
+                           (ST_INVALIDATED, time.time(), tid, ST_DONE))
+                _queue_trade_notices(db, tid, 'invalidated')
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+
+async def admin_send_fee(client, uid, tid):
+    """Resolve destination, atomically validate and claim once, then send."""
+    if not is_p2p_admin(uid):
+        return 'not authorized'
+    # Resolve the destination before the transaction: no asynchronous wallet work
+    # may occur between validation/claim and starting the send.
+    try:
+        owner = admin_id()
+        if not owner:
+            return 'held or already attempted'
+        dest = await spark_address_of(owner)
+    except Exception:
+        logging.exception('p2p fee destination unavailable for trade %s', tid)
+        return 'held or no send attempted'
+    with _db_lock:
+        db = _connect()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            tr = db.execute('SELECT * FROM trades WHERE id=?', (tid,)).fetchone()
+            proof = db.execute("SELECT a.payment_id FROM escrow_adjudications a JOIN escrow_events e ON e.id=a.event_id WHERE a.trade_id=? AND a.kind='payout' AND e.conflict=0 AND e.direction='SEND' AND e.amount=a.amount AND e.status='COMPLETED' AND e.payment_id=a.payment_id AND EXISTS (SELECT 1 FROM escrow_observations o WHERE o.event_id=e.id AND o.direction='SEND' AND o.amount=e.amount AND o.status='COMPLETED')", (tid,)).fetchone()
+            reuse = db.execute('SELECT (SELECT COUNT(*) FROM trades WHERE payout_id=?) + (SELECT COUNT(*) FROM trades WHERE refund_id=?) + (SELECT COUNT(*) FROM escrow_fee_attempts WHERE payment_id=?)', (proof['payment_id'], proof['payment_id'], proof['payment_id'])).fetchone()[0] if proof else 0
+            if not tr or not proof or reuse != 1 or not tr['escrow_verified'] or (tr['safety_version'] or 0) < 1 or tr['stage'] != ST_DONE or tr['payout_id'] != proof['payment_id'] or tr['fee_paid'] or tr['fee_tries'] or not tr['fee'] or tr['fee'] < 0:
+                db.commit()
+                return 'held or already attempted'
+            if db.execute('SELECT 1 FROM escrow_fee_attempts WHERE trade_id=?', (tid,)).fetchone():
+                db.commit()
+                return 'held or already attempted'
+            db.execute('INSERT INTO escrow_fee_attempts(trade_id,admin_uid,claimed_at,amount) VALUES (?,?,?,?)', (tid, uid, time.time(), tr['fee']))
+            db.execute('UPDATE trades SET fee_tries=fee_tries+1 WHERE id=?', (tid,))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    try:
+        ok, pid, err = await send_sats_from_escrow(dest, tr['fee'], f'adminfee#{tid}', gate=lambda: _fee_send_still_valid(tid))
+        if ok == 'PENDING' or ok is True:
+            if isinstance(pid, str) and pid.strip():
+                _bind_fee_payment(tid, pid)
+                return 'held: adjudicate with completed evidence'
+        return 'held: payment ID unavailable or outcome uncertain'
+    except Exception:
+        logging.exception('p2p fee attempt held for trade %s', tid)
+        return 'held: outcome unknown'
+
+
+def _complete_escrow_trade(tid, payout):
+    # shortcut: SDK history lacks authoritative completeness/uniqueness proof;
+    # retain all in-flight trades until a proven settlement design exists.
+    return None
+
+
+def _bind_escrow_send(tid, pid, payout):
+    """Persist even reused IDs as evidence, but mark them ambiguous atomically."""
+    with _db_lock:
+        db = _connect()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            tr = db.execute('SELECT * FROM trades WHERE id=?', (tid,)).fetchone()
+            stage, column = (ST_PAYOUT, 'payout_id') if payout else (ST_REFUND, 'refund_id')
+            if not tr or tr['stage'] != stage:
+                db.commit()
+                return
+            db.execute(f'UPDATE trades SET {column}=?, updated=? WHERE id=? AND stage=?',
+                       (pid, time.time(), tid, stage))
+            if isinstance(pid, str) and pid.strip():
+                count = db.execute('SELECT COUNT(*) FROM trades WHERE payout_id=? OR refund_id=?', (pid, pid)).fetchone()[0]
+                opposite = tr['refund_id'] if payout else tr['payout_id']
+                if count > 1 or opposite == pid:
+                    now = time.time()
+                    event = db.execute('SELECT id FROM escrow_events WHERE payment_id=?', (pid,)).fetchone()
+                    amount = str(payout_amount_of(tr) if payout else refund_amount_of(tr))
+                    if event is None:
+                        event_id = db.execute('INSERT INTO escrow_events(payment_id,direction,amount,status,conflict,first_seen,last_seen) VALUES (?,?,?,?,1,?,?)',
+                                              (pid, 'SEND', amount, 'ID_REUSED', now, now)).lastrowid
                     else:
-                        await finish_refund(row['id'])
+                        event_id = event['id']
+                        db.execute('UPDATE escrow_events SET conflict=1,last_seen=?,reviewed_by=NULL,reviewed_at=NULL,review_note=NULL WHERE id=?', (now, event_id))
+                    db.execute('INSERT OR IGNORE INTO escrow_observations(event_id,direction,amount,status,observed_at) VALUES (?,?,?,?,?)',
+                               (event_id, 'SEND', amount, 'ID_REUSED', now))
+                    db.execute('INSERT OR IGNORE INTO escrow_alerts(event_id,direction,amount,status) VALUES (?,?,?,?)',
+                               (event_id, 'SEND', amount, 'ID_REUSED'))
+                    db.execute('UPDATE trades SET fee_safe=0 WHERE payout_id=?', (pid,))
+                    _invalidate_event_trades(db, event_id)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+
+async def reconcile_escrow_send(pid):
+    if not isinstance(pid, str) or not pid.strip():
+        return
+    event = _one('SELECT id FROM escrow_events WHERE payment_id=?', (pid,))
+    if event:
+        await _deliver_escrow_alerts(event['id'])
+    # The final decision is inside finish_*'s transaction, not this advisory lookup.
+    for tr in _rows('SELECT id,stage FROM trades WHERE payout_id=? OR refund_id=?', (pid, pid)):
+        if tr['stage'] == ST_PAYOUT:
+            await finish_payout(tr['id'])
+        elif tr['stage'] == ST_REFUND:
+            await finish_refund(tr['id'])
+
+
+async def _deliver_escrow_alerts(event_id=None):
+    sql = 'SELECT * FROM escrow_alerts WHERE sent_at IS NULL'
+    args = ()
+    if event_id is not None:
+        sql += ' AND event_id=?'
+        args = (event_id,)
+    for alert in _rows(sql + ' ORDER BY id', args):
+        try:
+            sent = await notify(_bot().client, admin_id(),
+                T(admin_id(), 'adm_alert_event', event_id=alert["event_id"], direction=alert["direction"], amount=alert["amount"], status=alert["status"]))
+        except Exception as e:
+            logging.error(f'p2p escrow alert delivery failed: {e}')
+            continue
+        if sent is not None:
+            _exec('UPDATE escrow_alerts SET sent_at=? WHERE id=? AND sent_at IS NULL', (time.time(), alert['id']))
+
+
+async def deliver_trade_notices(client, tid=None):
+    sql = 'SELECT * FROM escrow_trade_notices WHERE sent_at IS NULL'
+    args = ()
+    if tid is not None:
+        sql += ' AND trade_id=?'
+        args = (tid,)
+    for row in _rows(sql + ' ORDER BY trade_id,kind,target', args):
+        tr = get_trade(row['trade_id'])
+        if not tr:
+            continue
+        target, kind = row['target'], row['kind']
+        if tr['stage'] == ST_INVALIDATED and kind != 'invalidated':
+            _exec('UPDATE escrow_trade_notices SET sent_at=? WHERE trade_id=? AND kind=? AND target=? AND sent_at IS NULL',
+                  (time.time(), tr['id'], kind, target))
+            continue
+        try:
+            if target in ('buyer', 'seller'):
+                who = tr[target]
+                result = await notify(client, who, T(who, 'trade_notice_' + kind, id=tr['id']))
+                if result is None:
+                    continue
+            elif target == 'admin':
+                who = admin_id()
+                if not who or await notify(client, who, T(who, 'trade_notice_' + kind, id=tr['id'])) is None:
+                    continue
+            elif target == 'room':
+                if await update_room(client, tr['id']) is False:
+                    continue
+            else:
+                if await channel_status(tr['order_id'], T(tr['seller'], 'trade_notice_' + kind, id=tr['id'])) is False:
+                    continue
+            _exec('UPDATE escrow_trade_notices SET sent_at=? WHERE trade_id=? AND kind=? AND target=? AND sent_at IS NULL',
+                  (time.time(), tr['id'], kind, target))
+        except Exception:
+            logging.exception('p2p trade notice failed for #%s', tr['id'])
+
+
+async def replay_escrow_journal():
+    for row in _rows("SELECT payment_id FROM escrow_events WHERE direction='SEND' AND status='COMPLETED' AND conflict=0"):
+        try:
+            await reconcile_escrow_send(row['payment_id'])
+        except Exception:
+            logging.exception('p2p journal replay failed for payment %s', row['payment_id'])
+    await _deliver_escrow_alerts()
+    try:
+        await deliver_trade_notices(_bot().client)
+    except Exception:
+        logging.exception('p2p trade notice replay failed')
+
+
+def _attribute_lock_receipt(event_id):
+    """Exact-amount auto-attribution of an escrow receipt (safety version 2).
+
+    One atomic transaction: validate the journaled event, prove the amount
+    matches exactly ONE version>=2 trade in locking with lock_sent=1, then
+    claim the transition with a conditional UPDATE (rowcount==1).  Returns
+    ('locked', tid) when a trade was credited, ('echo', tid) when the single
+    matching trade is already locked by its own verified send (first receipt
+    only — resolved quietly), or None for every ambiguous case; None keeps
+    the existing hold-and-notify path."""
+    with _db_lock:
+        db = _connect()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            ev = db.execute('SELECT * FROM escrow_events WHERE id=?', (event_id,)).fetchone()
+            if ev is None or ev['conflict'] or ev['direction'] != 'RECEIVE' \
+                    or ev['status'] != 'COMPLETED' or not ev['payment_id']:
+                db.commit()
+                return None
+            try:
+                amount = int(str(ev['amount']))
+            except (TypeError, ValueError):
+                db.commit()
+                return None
+            if amount <= 0:
+                db.commit()
+                return None
+            pid = ev['payment_id']
+            # A payment ID already bound to any send or human decision can
+            # never be reused to credit a lock.
+            reuse = db.execute('SELECT (SELECT COUNT(*) FROM trades WHERE payout_id=?) '
+                               '+ (SELECT COUNT(*) FROM trades WHERE refund_id=?) '
+                               '+ (SELECT COUNT(*) FROM escrow_fee_attempts WHERE payment_id=?) '
+                               '+ (SELECT COUNT(*) FROM escrow_adjudications WHERE payment_id=?)',
+                               (pid, pid, pid, pid)).fetchone()[0]
+            if reuse:
+                db.commit()
+                return None
+            # A second completed receipt of the same amount proves nothing;
+            # hold it for manual review instead of crediting either.
+            dup = db.execute("SELECT COUNT(*) FROM escrow_events WHERE id<>? AND direction='RECEIVE' "
+                             "AND amount=? AND status='COMPLETED'", (event_id, ev['amount'])).fetchone()[0]
+            if dup:
+                db.commit()
+                return None
+            locking = db.execute('SELECT id FROM trades WHERE stage=? AND COALESCE(lock_sent,0)=1 '
+                                 'AND COALESCE(safety_version,0)>=2 AND lock_amount=?',
+                                 (ST_LOCKING, amount)).fetchall()
+            locked = db.execute('SELECT id FROM trades WHERE stage=? AND COALESCE(escrow_verified,0)=1 '
+                                'AND COALESCE(lock_sent,0)=1 AND COALESCE(safety_version,0)>=2 AND lock_amount=?',
+                                (ST_LOCKED, amount)).fetchall() if not locking else []
+            if len(locking) == 1 and not locked:
+                cur = db.execute('UPDATE trades SET stage=?, escrow_verified=1, updated=?, '
+                                 'locked_at=COALESCE(locked_at,?), cancel_seller=0, cancel_buyer=0 '
+                                 'WHERE id=? AND stage=? AND COALESCE(lock_sent,0)=1 '
+                                 'AND COALESCE(safety_version,0)>=2 AND lock_amount=?',
+                                 (ST_LOCKED, time.time(), time.time(), locking[0]['id'], ST_LOCKING, amount))
+                if cur.rowcount == 1:
+                    db.execute('UPDATE escrow_alerts SET sent_at=COALESCE(sent_at,?) WHERE event_id=? '
+                               'AND sent_at IS NULL', (time.time(), event_id))
+                    tid = locking[0]['id']
+                    db.commit()
+                    return ('locked', tid)
+                db.commit()
+                return None
+            if len(locking) == 0 and len(locked) == 1:
+                # expected counterpart of a lock already verified by the
+                # seller's own send result; resolve quietly, no admin alert
+                db.execute('UPDATE escrow_alerts SET sent_at=COALESCE(sent_at,?) WHERE event_id=? '
+                           'AND sent_at IS NULL', (time.time(), event_id))
+                tid = locked[0]['id']
+                db.commit()
+                return ('echo', tid)
+            db.commit()
+            return None   # zero or multiple candidates: hold
+        except Exception:
+            db.rollback()
+            raise
+
+
+async def _attribute_and_announce(event_id):
+    """Run receipt attribution; announce an auto-lock like a send-verified lock."""
+    try:
+        result = _attribute_lock_receipt(event_id)
+    except Exception:
+        logging.exception('p2p receipt attribution failed')
+        return
+    if not result:
+        return
+    kind, tid = result
+    tr = get_trade(tid)
+    if not tr:
+        return
+    if kind == 'echo':
+        logging.info(f'p2p receipt for trade #{tid} matches its verified lock; resolved quietly')
+        return
+    await _announce_locked(tr, 'LOCKED (auto-attributed unique lock amount)')
+    try:
+        await notify(_bot().client, admin_id(),
+                     T(admin_id(), 'adm_lock_auto', id=tid, amount=fmt(tr['lock_amount'])))
+    except Exception:
+        logging.exception('p2p auto-lock admin notice failed')
+
+
+async def on_escrow_payment(ptype, amount, pid, status, recorded=None):
+    """Journal first; receipts are attributed only by exact unique lock amount."""
+    event_id, _ = recorded or record_escrow_event(ptype, amount, pid, status)
+    if _event_value(ptype) == 'RECEIVE':
+        await _attribute_and_announce(event_id)
+    await _deliver_escrow_alerts(event_id)
+    try:
+        await deliver_trade_notices(_bot().client)
+    except Exception:
+        logging.exception('p2p trade notice delivery failed')
+    if _event_value(ptype) == 'SEND':
+        await reconcile_escrow_send(pid)
 
 
 async def startup_scan():
     """One-shot after restart: resolve locks/payouts that landed while down."""
+    # Incoming addresses are shared; uncertain seller locks remain held.
     try:
-        since = int(time.time()) - 48 * 3600
+        for tr in _rows('SELECT id FROM trades WHERE stage=? AND COALESCE(safety_version,0)=0', (ST_LOCKING,)):
+            await notify(_bot().client, admin_id(),
+                         f'⚠️ p2p #{tr["id"]}: legacy lock outcome unknown; held, do not resend; manual investigation required')
         sdk = await escrow_sdk()
-        resp = await sdk.list_payments(request=_bot().ListPaymentsRequest(
-            from_timestamp=since, limit=100))
-        payments = getattr(resp, 'payments', []) or []
-        for p in payments:
-            ptype = str(getattr(p, 'payment_type', ''))
-            status = str(getattr(p, 'status', ''))
-            amount = getattr(p, 'amount_sats', getattr(p, 'amount', 0)) or 0
-            pid = getattr(p, 'id', '')
-            if 'COMPLETED' not in status:
-                continue
-            if 'RECEIVE' in ptype:
-                row = _one("SELECT * FROM trades WHERE stage=? ORDER BY created ASC", (ST_LOCKING,))
-                if row and amount == row['sats'] + row['fee']:
-                    await mark_locked(row['id'])
-            elif 'SEND' in ptype:
-                hit = _one('SELECT * FROM trades WHERE (payout_id=? AND stage=?) '
-                           'OR (refund_id=? AND stage=?)',
-                           (pid, ST_PAYOUT, pid, ST_REFUND))
-                if hit:
-                    if hit['payout_id'] == pid and hit['stage'] == ST_PAYOUT:
-                        await finish_payout(hit['id'])
-                    elif hit['refund_id'] == pid and hit['stage'] == ST_REFUND:
-                        await finish_refund(hit['id'])
+        offset, limit = 0, 100
+        # Best-effort observations only; this is not a proven stable snapshot.
+        until = int(time.time())
+        seen_pages = set()
+        while True:
+            resp = await sdk.list_payments(request=_bot().ListPaymentsRequest(
+                to_timestamp=until, offset=offset, limit=limit, sort_ascending=True))
+            payments = getattr(resp, 'payments', []) or []
+            if not payments:
+                break
+            page = tuple(getattr(p, 'id', None) for p in payments)
+            if page in seen_pages:
+                raise RuntimeError('payment pagination repeated; history incomplete')
+            seen_pages.add(page)
+            for p in payments:
+                if _payment_is_sats(p):
+                    ev_id, _ = record_escrow_event(str(getattr(p, 'payment_type', '')),
+                        getattr(p, 'amount_sats', getattr(p, 'amount', 0)) or 0,
+                        getattr(p, 'id', ''), str(getattr(p, 'status', '')))
+                    # receipts observed while offline attribute the same way
+                    await _attribute_and_announce(ev_id)
+            offset += len(payments)
     except Exception as e:
         logging.error(f'p2p startup scan failed: {e}')
+        try:
+            await notify(_bot().client, admin_id(), '⚠️ P2P payment history scan incomplete; held events require manual investigation.')
+        except Exception:
+            pass
+    # Retry alerts even after failure; observations never authorize settlement.
+    await replay_escrow_journal()
 
 
 # ==================== UI renderers ====================
@@ -894,33 +1637,66 @@ def _btn(label, data):
     return Button.inline(label, data.encode() if isinstance(data, str) else data)
 
 
+
+def get_stage_timer_text(uid, tr):
+    st = tr['stage']
+    now = time.time()
+    if st == ST_LOCKING:
+        start = tr.get('lock_started') or tr.get('created') or now
+        rem = LOCK_WAIT_SECS - (now - start)
+        if rem > 0:
+            m = int(rem // 60)
+            s = int(rem % 60)
+            return T(uid, 'timer_lock_wait', m=m, s=s)
+        else:
+            return T(uid, 'timer_lock_expired')
+    elif st == ST_LOCKED:
+        locked_at = tr.get('locked_at') or tr.get('updated') or tr.get('created') or now
+        elapsed = int(now - locked_at)
+        rem = FIAT_TIMEOUT_SECS - elapsed
+        em = elapsed // 60
+        if rem > 0:
+            rm = rem // 60
+            return T(uid, 'timer_locked', em=em, rm=rm)
+        else:
+            return T(uid, 'timer_locked_over', em=em)
+    elif st == ST_FIAT:
+        fiat_at = tr.get('fiat_at') or tr.get('updated') or now
+        elapsed = int(now - fiat_at)
+        rem = RELEASE_TIMEOUT_SECS - elapsed
+        eh = elapsed // 3600
+        if rem > 0:
+            rh = rem // 3600
+            return T(uid, 'timer_fiat', eh=eh, rh=rh)
+        else:
+            return T(uid, 'timer_fiat_over', eh=eh)
+    return ''
+
+
 def room_text(uid, tr, stage_note=None):
+
     fa = lang_of(uid) == 'fa'
     role = T(uid, 'you_are_seller') if uid == tr['seller'] else T(uid, 'you_are_buyer')
     method = f"\n{T(uid, 'method_l')}: {tr['method']}" if tr.get('method') else ''
     head = T(uid, 'room_title', id=tr['id'])
     fee_line = (f' (+{fmt(tr["fee"])} {T(uid, "fee_short")})'
                 if uid == tr['seller'] else '')
-    amount_line = (f'🪙 {fmt(tr["sats"])} ساتوشی{fee_line}' if fa
-                   else f'🪙 {fmt(tr["sats"])} sats{fee_line}')
+    amount_line = T(uid, 'amount_sats', amount=fmt(tr['sats'])) + fee_line
     deal_line = f'🏷 {tr["price"]}'
     o = (_one('SELECT side, fiat_amount, fiat_code FROM orders WHERE id=?',
               (tr['order_id'],)) if tr.get('order_id') else None)
     if o and o.get('fiat_amount'):
         _fw = fiat_word(uid, o['fiat_code'] or 'IRT')
         _amt = f'🏷 {int(o["fiat_amount"]):,} {_fw}'
-        if fa:
-            deal_line = f'{"فروش" if o["side"] == "sell" else "خرید"} به اندازه\n{_amt}'
-        else:
-            deal_line = f'{"Selling" if o["side"] == "sell" else "Buying"} for\n{_amt}'
+        deal_line = T(uid, 'deal_sell_for' if o['side'] == 'sell' else 'deal_buy_for',
+                      amt=_amt)
     rate_line = ''
     if tr.get('rate_used'):
         fw = 'تومان' if tr['rate_used'] >= 1_000_000 else 'USD'
         _src = 'yadio.io' if fw == 'تومان' else 'bot'
         _p = tr.get('premium')
         _ptag = f' ({_p:+g}%)' if _p else ''
-        rate_line = (f'\n📈 نرخ: {_src}{_ptag}' if fa
-                     else f'\n📈 Rate: {_src}{_ptag}')
+        rate_line = f'\n{T(uid, "rate_line", src=_src, ptag=_ptag)}'
     lines = (
         f'{head}\n'
         f'━━━━━━━━━━━━━━\n\n'
@@ -928,8 +1704,10 @@ def room_text(uid, tr, stage_note=None):
         f'{amount_line}\n'
         f'{deal_line}{rate_line}{method}\n\n'
     )
+    timer_txt = get_stage_timer_text(uid, tr)
+    timer_line = f'{timer_txt}\n\n' if timer_txt else ''
     note = stage_note if stage_note is not None else stage_note_for(uid, tr)
-    text = lines + note
+    text = lines + timer_line + note
     if fa:
         text = '\n'.join('\u200f' + ln if ln.strip() else ln
                          for ln in text.split('\n'))
@@ -939,6 +1717,11 @@ def room_text(uid, tr, stage_note=None):
 def stage_note_for(uid, tr):
     st = tr['stage']
     if st == ST_LOCKING:
+        if tr.get('lock_sent') or not tr.get('safety_version'):
+            return T(uid, 'lock_held')
+        la = lock_amount_of(tr)
+        if la is not None and uid == tr['seller'] and int(tr.get('safety_version') or 0) >= 2:
+            return T(uid, 'st_locking') + '\n' + T(uid, 'lock_amount_note', amt=fmt(la))
         return T(uid, 'st_locking')
     if st == ST_LOCKED:
         return T(uid, 'st_locked') + '\n' + (
@@ -950,6 +1733,8 @@ def stage_note_for(uid, tr):
         return T(uid, 'st_payout')
     if st == ST_REFUND:
         return T(uid, 'st_payout')
+    if st == ST_INVALIDATED:
+        return T(uid, 'trade_notice_invalidated', id=tr['id'])
     if st == ST_DONE:
         return T(uid, 'st_done')
     if st == ST_REFUNDED:
@@ -966,7 +1751,7 @@ def room_buttons(uid, tr, confirm=None):
     st = tr['stage']
     rows = []
     if confirm == 'lock' and uid == tr['seller']:
-        rows.append([_btn(T(uid, 'lock_yes').format(amt=fmt(tr['sats'] + tr['fee'])),
+        rows.append([_btn(T(uid, 'lock_yes').format(amt=fmt(lock_amount_of(tr) or (tr['sats'] + tr['fee']))),
                           f'p2p:lockgo:{tr["id"]}'),
                      _btn('«', f'p2p:room:{tr["id"]}')])
     elif confirm == 'fiat' and uid == tr['buyer']:
@@ -1012,6 +1797,7 @@ async def update_room(client, tid, note=None, buttons=True):
     if not tr:
         return
     panels = json.loads(tr.get('panels') or '{}')
+    delivered = True
     for uid_s, chat_msg in panels.items():
         uid = int(uid_s)
         chat_id, msg_id = chat_msg
@@ -1020,7 +1806,9 @@ async def update_room(client, tid, note=None, buttons=True):
                 chat_id, msg_id, room_text(uid, tr, note),
                 buttons=room_buttons(uid, tr) if buttons else None)
         except Exception as e:
+            delivered = False
             logging.debug(f'p2p room edit {uid}: {e}')
+    return delivered
 
 
 async def channel_status(oid, status_line, delete=False):
@@ -1028,18 +1816,20 @@ async def channel_status(oid, status_line, delete=False):
     try:
         o = get_order(oid)
         if not o or not o.get('channel_msg'):
-            return
+            return True
         b = _bot()
         if delete:
             await b.client.delete_messages(P2P_LIST_CHANNEL, o['channel_msg'])
             _exec('UPDATE orders SET channel_msg=NULL WHERE id=?', (oid,))
-            return
+            return True
         card = order_card(0, o)
         await b.client.edit_message(P2P_LIST_CHANNEL, o['channel_msg'],
                                     f'{status_line}\n\n{card}',
                                     buttons=None, parse_mode='html')
+        return True
     except Exception as e:
         logging.debug(f'p2p channel status {oid}: {e}')
+        return False
 
 
 async def channel_repost(oid):
@@ -1052,12 +1842,11 @@ async def channel_repost(oid):
         b = _bot()
         card = order_card(o['maker'], o)
         card = '\n'.join(l for l in card.split('\n')
-                         if 'این سفارش مال خودته' not in l
-                         and 'مال خودته' not in l)
+                         if 'مال خودته' not in l and 'own order' not in l.lower())
         if o['side'] == 'sell':
-            label = '🛒 خرید ساتوشی' if lang_of(o['maker']) == 'fa' else '🛒 Buy sats'
+            label = T(o['maker'], 'take_sell_order')
         else:
-            label = '💸 فروش ساتوشی' if lang_of(o['maker']) == 'fa' else '💸 Sell sats'
+            label = T(o['maker'], 'take_buy_order')
         url = f'https://t.me/Zap_lnBot?start=p2p_{oid}'
         from telethon import Button as _BU
         btn = [[_BU.url(label, url)]]
@@ -1077,7 +1866,7 @@ async def audit(client, tid, event, extra=''):
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if tr:
             text = (f'🤝 P2P #{tid} · {event}\n'
-                    f'💰 {tr["sats"]}+{tr["fee"]}s · 🏷 {tr["price"]}\n'
+                    f'💰 {tr["sats"]}+{tr["fee"]}s · 🏷 {_h(str(tr["price"]))}\n'
                     f'👤 buyer {user_link(tr["buyer"])} · seller {user_link(tr["seller"])}\n'
                     f'📌 stage: {tr["stage"]}\n'
                     f'🕒 {ts}{chr(10) + extra if extra else ""}')
@@ -1192,7 +1981,7 @@ async def save_rating(client, rater, ratee, tid, stars):
         try:
             tg = getattr(client, 'client', client)   # bot wrapper → telethon
             # silent confirm: edit the ask-message only — no new message
-            await tg.edit_message(loc[0], loc[1], '⭐ ثبت شد',
+            await tg.edit_message(loc[0], loc[1], T(rater, 'rate_saved'),
                                   buttons=None)
             return True
         except Exception as e:
@@ -1214,18 +2003,6 @@ def maker_stats(maker_id):
 _rate_cache = {'rate': None, 'code': 'IRT', 'ts': 0}
 
 
-def _run_async(coro):
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(1) as ex:
-            return ex.submit(asyncio.run, coro).result(timeout=15)
-    return asyncio.run(coro)
-
-
 FIAT_FLAGS = {'IRT': '🇮🇷', 'IRR': '🇮🇷', 'USD': '🇺🇸', 'EUR': '🇪🇺',
               'TRY': '🇹🇷', 'AED': '🇦🇪', 'GBP': '🇬🇧', 'RUB': '🇷🇺'}
 
@@ -1241,31 +2018,27 @@ def order_card(uid, o, pos=None, total=None):
 
     # headline: «💸 فروش ساتوشی» / «🛒 خرید ساتوشی»
     if o['side'] == 'sell':
-        side = ('💸 فروش ساتوشی' if fa else '💸 Selling sats')
+        side = T(uid, 'card_sell')
     else:
-        side = ('🛒 خرید ساتوشی' if fa else '🛒 Buying sats')
+        side = T(uid, 'card_buy')
 
     prem_tag = f' {prem:+g}%' if prem else ''
     if is_float and o.get('fiat_amount'):
         # fiat-based: fiat amount fixed; sats at market rate
-        amount = f'💵 {int(o["fiat_amount"]):,} {fw} {flag}'.strip()
-        price = (f'📈 قیمت بازار ({src_name}){prem_tag}'
-                 if fa else f'📈 Market rate ({src_name}){prem_tag}')
+        amount = T(uid, 'amount_fiat', amount=f'{int(o["fiat_amount"]):,}',
+                   fiat=fw, flag=flag).strip()
+        price = T(uid, 'rate_market', src_name=src_name, prem_tag=prem_tag)
     elif is_float:
         # sats-based: sats exact; price at market
-        amount = (f'🪙 {fmt(o["sats"])} ساتوشی' if fa
-                  else f'🪙 {fmt(o["sats"])} sats')
-        price = (f'📈 قیمت بازار ({src_name}){prem_tag}'
-                 if fa else f'📈 Market rate ({src_name}){prem_tag}')
+        amount = T(uid, 'amount_sats', amount=fmt(o["sats"]))
+        price = T(uid, 'rate_market', src_name=src_name, prem_tag=prem_tag)
     else:
-        amount = (f'🪙 {fmt(o["sats"])} ساتوشی' if fa
-                  else f'🪙 {fmt(o["sats"])} sats')
-        price = (f'🏷 به قیمت {o["price"]} {flag}'.strip()
-                 if fa else f'🏷 At {o["price"]}')
+        amount = T(uid, 'amount_sats', amount=fmt(o["sats"]))
+        price = T(uid, 'fixed_price_line', price=_h(str(o["price"])), fiat=fw)
 
-    method = f'\n{T(uid, "method_l")}: {o["method"]}' if o.get('method') else ''
+    method = f'\n{T(uid, "method_l")}: {_h(str(o["method"]))}' if o.get('method') else ''
     stats = f'\n{maker_stats_line(uid, o["maker"])}'
-    own = '\n📌 این سفارش مال خودته' if o['maker'] == uid else ''
+    own = f'\n{T(uid, "card_own")}' if o['maker'] == uid else ''
     page = f'  ·  {pos + 1}/{total}' if pos is not None else ''
     head = f'📢 {T(uid, "market")}{page}'
 
@@ -1285,12 +2058,9 @@ def order_card(uid, o, pos=None, total=None):
 def maker_stats_line(uid, maker_id):
     avg, n = rating_stats(maker_id)
     if n:
-        word = 'معامله' if lang_of(uid) == 'fa' else 'trades'
-        return f'⭐ {avg} ({n} {word})'
+        return f'⭐ {avg} ({n} {T(uid, "stats_word")})'
     trades, days = maker_stats(maker_id)
-    if lang_of(uid) == 'fa':
-        return f'👤 کاربر در {days} روز {trades} معامله موفق داشته'
-    return f'👤 {trades} successful trades in {days} days'
+    return T(uid, 'stats_hist', trades=trades, days=days)
 
 
 def market_buttons(uid, orders, idx, filt):
@@ -1298,8 +2068,7 @@ def market_buttons(uid, orders, idx, filt):
     rows = []
     if orders:
         rows.append([_btn(T(uid, 'take'), f'p2p:take:{orders[idx]["id"]}')])
-    flabels = [('همه', 'all'), ('💸 فروش', 'sell'), ('🛒 خرید', 'buy')] \
-        if lang_of(uid) == 'fa' else [('All', 'all'), ('💸 Sell', 'sell'), ('🛒 Buy', 'buy')]
+    flabels = [(T(uid, 'mf_all'), 'all'), (T(uid, 'mf_sell'), 'sell'), (T(uid, 'mf_buy'), 'buy')]
     rows.append([_btn(f'« {t} »' if f == filt else t, f'p2p:mf:{f}') for t, f in flabels])
     if len(orders) > 1:
         rows.append([_btn('⬅️', f'p2p:mprev:{idx}:{filt}'),
@@ -1334,7 +2103,7 @@ def _prem_buttons(uid):
     """Preset premium/discount picker for the order wizard."""
     row1 = [_btn('-2%', 'p2p:prem:-2'), _btn('-1%', 'p2p:prem:-1'), _btn('0%', 'p2p:prem:0')]
     row2 = [_btn('+1%', 'p2p:prem:1'), _btn('+2%', 'p2p:prem:2'), _btn('+3%', 'p2p:prem:3')]
-    custom = _btn('✍️ دستی' if lang_of(uid) == 'fa' else '✍️ Custom', 'p2p:prem:custom')
+    custom = _btn(T(uid, 'prem_custom'), 'p2p:prem:custom')
     return [row1, row2, [custom]]
 
 
@@ -1346,18 +2115,24 @@ async def _wiz_premium_done(client, uid, prem):
     w['premium'] = prem
     if w.get('price_mode') == 'float':
         w['step'] = 'method'
+        _wiz[uid] = w
         return ''   # rate is read at take time
     if w.get('unit') == 'sats' or not w.get('fiat_amount'):
         w['step'] = 'method'
+        _wiz[uid] = w
         return ''
     # toman+fixed: resolve sats NOW from rate + premium
     rate, rate_fiat = await bot_fiat_rate(uid)
+    if _wiz.get(uid) is not w:
+        return None
     if not rate:
+        _wiz[uid] = w
         return None   # step stays 'premium' so the retry lands here again
     w['step'] = 'method'
     w['fiat_code'] = rate_fiat
     w['sats'] = float_sats(w['fiat_amount'], prem, rate)
     w['fee'] = fee_for(w['sats'])
+    _wiz[uid] = w
     return T(uid, 'fixed_resolved',
              sats=fmt(w['sats']), fiat=f'{int(w["fiat_amount"]):,}',
              prem=(f'+{prem:g}' if prem >= 0 else f'{prem:g}'))
@@ -1377,11 +2152,11 @@ async def wiz_start(client, uid, edit_event=None):
 
 async def wiz_text(client, event, uid, text):
     """Returns True when the step consumed the text."""
-    if uid in _wiz and isinstance(_wiz[uid], dict):
-        _wiz[uid]['_ts'] = time.time()
     w = _wiz.get(uid)
     if not w:
         return False
+    w['_ts'] = time.time()
+    _wiz[uid] = w
     step = w.get('step')
     if step == 'fiat_amount' and (w.get('unit') == 'toman' and not w.get('sats')):
         # sell-by-toman first step: store the toman amount, resolve sats from rate
@@ -1396,7 +2171,10 @@ async def wiz_text(client, event, uid, text):
                                 .replace('تومان', _fw).replace('Toman', _fw))
             return True
         w['fiat_amount'] = amt
+        _wiz[uid] = w
         rate, rate_fiat = await bot_fiat_rate(uid)
+        if _wiz.get(uid) is not w:
+            return True
         if not rate:
             await event.respond(T(uid, 'float_no_rate'))
             return True
@@ -1404,6 +2182,7 @@ async def wiz_text(client, event, uid, text):
         w['sats'] = float_sats(amt, 0, rate)
         w['fee'] = fee_for(w['sats'])
         w['step'] = 'pmode'
+        _wiz[uid] = w
         await event.respond(T(uid, 'price_mode'), buttons=[
             [_btn(T(uid, 'price_fixed'), 'p2p:pmode:fixed')],
             [_btn(T(uid, 'price_float'), 'p2p:pmode:float')],
@@ -1417,6 +2196,7 @@ async def wiz_text(client, event, uid, text):
         w['sats'] = n
         w['fee'] = fee_for(n)
         w['step'] = 'pmode'
+        _wiz[uid] = w
         await event.respond(T(uid, 'price_mode'), buttons=[
             [_btn(T(uid, 'price_fixed'), 'p2p:pmode:fixed')],
             [_btn(T(uid, 'price_float'), 'p2p:pmode:float')],
@@ -1430,6 +2210,7 @@ async def wiz_text(client, event, uid, text):
         w['sats'] = n
         w['fee'] = fee_for(n)
         w['step'] = 'method'
+        _wiz[uid] = w
         await event.respond(T(uid, 'wiz_method'),
                             buttons=[[_btn(T(uid, 'skip'), 'p2p:skipmethod')]])
         return True
@@ -1439,6 +2220,7 @@ async def wiz_text(client, event, uid, text):
         w['price'] = text
         w['price_mode'] = 'fixed'
         w['step'] = 'method'
+        _wiz[uid] = w
         await event.respond(T(uid, 'wiz_method'),
                             buttons=[[_btn(T(uid, 'skip'), 'p2p:skipmethod')]])
         return True
@@ -1452,6 +2234,7 @@ async def wiz_text(client, event, uid, text):
             return True
         w['fiat_amount'] = amt
         w['step'] = 'premium'
+        _wiz[uid] = w
         await event.respond(T(uid, 'wiz_premium'), buttons=_prem_buttons(uid))
         return True
     if step == 'premium':
@@ -1472,13 +2255,10 @@ async def wiz_text(client, event, uid, text):
     if step == 'method':
         w['method'] = text[:80] if text else ''
         w['step'] = 'ttl'
+        _wiz[uid] = w
         # expiry picker
-        if lang_of(uid) == 'fa':
-            t_text = '⏳ سفارش تا کی تو بازار بمونه؟'
-            t_labels = [r[0] for r in ORDER_TTLS]
-        else:
-            t_text = '⏳ How long should the order stay on the market?'
-            t_labels = [r[1] for r in ORDER_TTLS]
+        t_text = T(uid, 'ttl_ask')
+        t_labels = [T(uid, 'ttl_12h'), T(uid, 'ttl_24h'), T(uid, 'ttl_2d')]
         buttons = [[_btn(t_labels[0], f'p2p:ttl:{ORDER_TTLS[0][2]}'),
                     _btn(t_labels[1], f'p2p:ttl:{ORDER_TTLS[1][2]}')],
                    [_btn(t_labels[2], f'p2p:ttl:{ORDER_TTLS[2][2]}')],
@@ -1500,10 +2280,8 @@ async def wiz_review(client, event, uid):
     fa = lang_of(uid) == 'fa'
     method = f'\n{T(uid, "method_l")}: {w.get("method")}' if w.get('method') else ''
     ttl_row = next((r for r in ORDER_TTLS if r[2] == w.get('ttl_secs')), None)
-    if fa:
-        ttl_line = f'\n⏳ مهلت: {ttl_row[0]}' if ttl_row else ''
-    else:
-        ttl_line = f'\n⏳ Expires in: {ttl_row[1]}' if ttl_row else ''
+    ttl_line = (T(uid, 'ttl_line', label=ttl_row[0] if fa else ttl_row[1])
+                if ttl_row else '')
 
     mode = w.get('price_mode') or 'fixed'
     prem = w.get('premium') or 0
@@ -1513,22 +2291,20 @@ async def wiz_review(client, event, uid):
     src_name = 'yadio.io' if code in ('IRT', 'IRR') else 'bot'
     prem_tag = f' {prem:+g}%' if prem else ''
     if w.get('side') == 'sell':
-        side = ('💸 فروش ساتوشی' if fa else '💸 Selling sats')
+        side = T(uid, 'card_sell')
     else:
-        side = ('🛒 خرید ساتوشی' if fa else '🛒 Buying sats')
+        side = T(uid, 'card_buy')
 
     if mode == 'float' and w.get('unit') == 'toman' and w.get('fiat_amount'):
-        amount = f'💵 {int(w["fiat_amount"]):,} {fw} {flag}'.strip()
-        price = (f'📈 قیمت بازار ({src_name}){prem_tag}'
-                 if fa else f'📈 Market rate ({src_name}){prem_tag}')
+        amount = T(uid, 'amount_fiat', amount=f'{int(w["fiat_amount"]):,}',
+                   fiat=fw, flag=flag).strip()
+        price = T(uid, 'rate_market', src_name=src_name, prem_tag=prem_tag)
     elif mode == 'float':
-        amount = f'🪙 {fmt(w["sats"])} ساتوشی' if fa else f'🪙 {fmt(w["sats"])} sats'
-        price = (f'📈 قیمت بازار ({src_name}){prem_tag}'
-                 if fa else f'📈 Market rate ({src_name}){prem_tag}')
+        amount = T(uid, 'amount_sats', amount=fmt(w["sats"]))
+        price = T(uid, 'rate_market', src_name=src_name, prem_tag=prem_tag)
     else:
-        amount = f'🪙 {fmt(w["sats"])} ساتوشی' if fa else f'🪙 {fmt(w["sats"])} sats'
-        price = (f'🏷 به قیمت {w.get("price")} {flag}'.strip()
-                 if fa else f'🏷 At {w.get("price") or "—"}')
+        amount = T(uid, 'amount_sats', amount=fmt(w["sats"]))
+        price = T(uid, 'fixed_price_line', price=_h(str(w.get("price") or "—")), fiat=fw)
 
     text = (f'{T(uid, "wiz_review")}\n\n'
             f'━━━━━━━━━━━━━━\n'
@@ -1587,12 +2363,11 @@ async def wiz_publish(client, uid):
         o = get_order(oid)
         card = order_card(uid, o)          # maker's language
         card = '\n'.join(l for l in card.split('\n')
-                         if 'این سفارش مال خودته' not in l
-                         and 'مال خودته' not in l)
+                         if 'مال خودته' not in l and 'own order' not in l.lower())
         if o['side'] == 'sell':
-            label = '🛒 خرید ساتوشی' if lang_of(uid) == 'fa' else '🛒 Buy sats'
+            label = T(uid, 'take_sell_order')
         else:
-            label = '💸 فروش ساتوشی' if lang_of(uid) == 'fa' else '💸 Sell sats'
+            label = T(uid, 'take_buy_order')
         url = f'https://t.me/Zap_lnBot?start=p2p_{oid}'
         from telethon import Button as _BU
         btn = [[_BU.url(label, url)]]
@@ -1634,6 +2409,87 @@ def live_trade_of(uid):
     return rows[0] if rows else None
 
 
+LOCK_OFFSET_MIN = 1        # unique identification sats added to lock amounts
+LOCK_OFFSET_MAX = 997
+LOCK_UNIQUE_WINDOW_SECS = 48 * 3600
+_ACTIVE_LOCK_STAGES = ('locking', 'locked', 'fiat', 'payout', 'refund', 'refunding', 'disputed')
+
+
+def _assign_lock_amount(db, tid, sats, fee):
+    """Give the trade a lock amount unique among recent/live trades.
+
+    Must run inside the caller's IMMEDIATE transaction: candidate selection
+    and the UPDATE are one atomic step, so two concurrent takers of
+    equal-sized orders can never be assigned the same amount.  The small
+    offset (1..997 sats) differs from the raw sats+fee every legacy trade
+    paid, and from every lock/payment amount of the last 48h or still in a
+    money-live stage.  Returns the assigned amount, or None when the offset
+    space is exhausted (the trade then stays on the manual path, v1)."""
+    base = int(sats) + int(fee)
+    rows = db.execute(
+        'SELECT COALESCE(lock_amount, sats+fee) AS amt FROM trades WHERE id<>? '
+        'AND (COALESCE(lock_started,created,updated) > ? OR stage IN ('
+        + ','.join('?' for _ in _ACTIVE_LOCK_STAGES) + '))',
+        (tid, time.time() - LOCK_UNIQUE_WINDOW_SECS) + _ACTIVE_LOCK_STAGES).fetchall()
+    used = {int(r['amt']) for r in rows if r['amt'] is not None}
+    for offset in range(LOCK_OFFSET_MIN, LOCK_OFFSET_MAX + 1):
+        candidate = base + offset
+        if candidate not in used:
+            db.execute('UPDATE trades SET lock_amount=? WHERE id=? AND lock_amount IS NULL',
+                       (candidate, tid))
+            return candidate
+    return None   # pathological volume; trade stays manual-lock (safety v1)
+
+
+def lock_amount_of(tr):
+    """Exact sats the seller must send; None for legacy rows (manual handling)."""
+    la = tr.get('lock_amount') if tr else None
+    return int(la) if la else None
+
+
+def _tr_field(tr, name):
+    """Read a trade column from a dict (read API) or sqlite3.Row (in-txn)."""
+    if not tr:
+        return None
+    if isinstance(tr, dict):
+        return tr.get(name)
+    try:
+        return tr[name]
+    except (IndexError, KeyError):
+        return None
+
+
+def _v2_unique_lock(tr):
+    """The provably-unique lock amount, only for safety-version-2 trades.
+
+    Version 2 is set exactly when a unique lock amount was assigned, so the
+    pair (lock_amount set, safety_version>=2) is the dust-free settlement
+    contract; every lesser version keeps the historical amounts."""
+    la = _tr_field(tr, 'lock_amount')
+    sv = _tr_field(tr, 'safety_version')
+    return int(la) if la and int(sv or 0) >= 2 else None
+
+
+def payout_amount_of(tr):
+    """Exact sats the escrow pays the buyer on release.
+
+    v2: lock_amount - fee — the buyer also receives the unique-tag offset, so
+    the shared escrow wallet is left with zero dust once the fee sweeps
+    (locked = sats + fee + tag; paid out = (lock - fee) + fee).
+    v1/legacy: the raw trade amount, byte-identical to the historical send."""
+    la = _v2_unique_lock(tr)
+    return la - int(tr['fee']) if la is not None else int(tr['sats'])
+
+
+def refund_amount_of(tr):
+    """Exact sats refunded to the seller.
+
+    v2: the whole unique lock amount (seller gets everything back, dust = 0).
+    v1/legacy: sats + fee, byte-identical to the historical send."""
+    la = _v2_unique_lock(tr)
+    return la if la is not None else int(tr['sats']) + int(tr['fee'])
+
+
 async def take_order(client, uid, oid):
     """Transactional take: first taker wins; creates the trade."""
     if live_trade_of(uid):
@@ -1672,14 +2528,21 @@ async def take_order(client, uid, oid):
                     _prem = row['premium'] or 0
                     fiat_final = round(sats / 100_000_000 * rate_used
                                        * (1 + _prem / 100.0), 2)
+            fee = fee_for(sats)
             cur = db.execute(
                 'INSERT INTO trades (order_id, buyer, seller, sats, fee, price, method, '
-                'stage, created, updated, lock_started, fiat_final, rate_used, premium) '
-                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                (oid, buyer, seller, sats, fee_for(sats), row['price'],
+                'stage, created, updated, lock_started, fiat_final, rate_used, premium, safety_version) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (oid, buyer, seller, sats, fee, row['price'],
                  row['method'], ST_LOCKING, time.time(), time.time(), time.time(),
-                 fiat_final, rate_used, row['premium']))
+                 fiat_final, rate_used, row['premium'], 1))
             tid = cur.lastrowid
+            # Unique lock amount, assigned inside the same IMMEDIATE claim
+            # transaction: exact-amount receipt attribution becomes safe.
+            # Version 2 marks trades whose lock amount is provably unique;
+            # on exhaustion the trade stays v1 (manual path, unchanged).
+            if _assign_lock_amount(db, tid, sats, fee) is not None:
+                db.execute('UPDATE trades SET safety_version=2 WHERE id=?', (tid,))
             db.commit()
         except Exception:
             db.rollback()
@@ -1707,7 +2570,9 @@ async def do_lock(client, uid, tid):
         await notify(client, uid, T(uid, 'no_action'))
         return
     b = _bot()
-    need = tr['sats'] + tr['fee']
+    # v2 trades lock the pre-assigned unique amount (sats+fee+tag); v1/legacy
+    # trades keep sending the raw sats+fee exactly as before.
+    need = lock_amount_of(tr) or (tr['sats'] + tr['fee'])
 
     async def _lock_sdk():
         # runs on a worker loop — slow SDK calls never freeze buttons/chat
@@ -1726,47 +2591,75 @@ async def do_lock(client, uid, tid):
             payment_request=b.PaymentRequest.INPUT(input=dest),
             amount=need))
         resp = await sdk.send_payment(request=b.SendPaymentRequest(prepare_response=prep))
-        return str(getattr(getattr(resp, 'payment', None), 'status', ''))
+        payment = getattr(resp, 'payment', None)
+        return (str(getattr(payment, 'status', '')),
+                getattr(payment, 'id', '') or '')
 
+    claim = _exec('UPDATE trades SET lock_sent=1 WHERE id=? AND stage=? AND seller=? '
+                  'AND COALESCE(safety_version,0)>=1 AND COALESCE(lock_sent,0)=0 '
+                  "AND COALESCE(lock_started,created) > ((julianday('now')-2440587.5)*86400.0 - ?)",
+                  (tid, ST_LOCKING, uid, LOCK_WAIT_SECS))
+    if claim.rowcount != 1:
+        await notify(client, uid, T(uid, 'lock_held'))
+        return
     try:
-        status = await offloop(_lock_sdk())
-        if status is None:
+        result = await offloop(_lock_sdk())
+        if result is None:
+            _exec('UPDATE trades SET lock_sent=0 WHERE id=? AND stage=?', (tid, ST_LOCKING))
             await notify(client, uid, T(uid, 'lock_fail_bal', need=fmt(need)))
             return
-        logging.info(f'p2p lock send trade #{tid}: {need}s -> {status}')
-        if 'COMPLETED' in status or 'PENDING' in status:
+        status, pay_id = result
+        logging.info(f'p2p lock send trade #{tid}: {need}s -> {status} ({pay_id})')
+        if pay_id:
+            _exec('UPDATE trades SET lock_pay_id=? WHERE id=? AND stage=?', (pay_id, tid, ST_LOCKING))
+        if _event_value(status) == 'COMPLETED':
             await mark_locked(tid)
         else:
-            await update_room(client, tid, note=T(uid, 'st_locking_progress'))
+            # Pending, failure and unknown outcomes all remain claimed. A send
+            # may have succeeded despite an error; safe reconciliation is unavailable.
+            await notify(client, uid, T(uid, 'lock_held'))
+            await notify(client, admin_id(), f'⚠️ p2p #{tid}: lock {status or "unknown"} — held; safe reconciliation unavailable')
     except Exception as e:
         logging.error(f'p2p lock trade #{tid}: {e}')
-        await notify(client, uid, T(uid, 'lock_fail', err=str(e)[:120]))
+        await notify(client, admin_id(), f'⚠️ p2p #{tid}: lock outcome unknown — manual reconciliation required')
+        await notify(client, uid, T(uid, 'lock_held'))
 
 
-async def mark_locked(tid):
-    tr = get_trade(tid)
-    if not tr or tr['stage'] != ST_LOCKING:
-        return
-    _exec('UPDATE trades SET stage=?, updated=?, lock_started=COALESCE(lock_started, ?) '
-          'WHERE id=? AND stage=?',
-          (ST_LOCKED, time.time(), time.time(), tid, ST_LOCKING))
+async def _announce_locked(tr, event='LOCKED (escrow funded)'):
+    """Room/audit announcements shared by the send-result and receipt paths."""
     b = _bot()
     for party in (tr['buyer'], tr['seller']):
-        await reply_to_room(b.client, tid, party, f'🔒 {T(party, "st_locked")}')
-    await update_room(b.client, tid)
-    await audit(b.client, tid, 'LOCKED (escrow funded)')
-    logging.info(f'p2p trade #{tid} LOCKED')
+        await reply_to_room(b.client, tr['id'], party, f'🔒 {T(party, "st_locked")}')
+    await update_room(b.client, tr['id'])
+    await audit(b.client, tr['id'], event)
+    logging.info(f'p2p trade #{tr["id"]} LOCKED')
     # warm the buyer's spark address so the payout later doesn't stall
     asyncio.get_event_loop().create_task(spark_address_of(tr['buyer']))
 
 
+async def mark_locked(tid):
+    """Only called after the seller's own send returned COMPLETED."""
+    tr = get_trade(tid)
+    if not tr or tr['stage'] != ST_LOCKING:
+        return
+    cur = _exec('UPDATE trades SET stage=?, escrow_verified=1, updated=?, locked_at=?, '
+                'cancel_seller=0, cancel_buyer=0 WHERE id=? AND stage=? AND lock_sent=1',
+                (ST_LOCKED, time.time(), time.time(), tid, ST_LOCKING))
+    if cur.rowcount != 1:
+        return
+    await _announce_locked(tr)
+
+
 async def do_fiat(client, uid, tid):
     tr = get_trade(tid)
-    if not tr or tr['stage'] != ST_LOCKED or uid != tr['buyer']:
+    if not tr or tr['stage'] != ST_LOCKED or uid != tr['buyer'] or not tr['escrow_verified']:
         await notify(client, uid, T(uid, 'no_action'))
         return
-    _exec('UPDATE trades SET stage=?, fiat_at=?, updated=? WHERE id=?',
-          (ST_FIAT, time.time(), time.time(), tid))
+    cur = _exec('UPDATE trades SET stage=?, fiat_at=?, updated=?, '
+                'cancel_seller=0, cancel_buyer=0 WHERE id=? AND stage=?',
+                (ST_FIAT, time.time(), time.time(), tid, ST_LOCKED))
+    if cur.rowcount != 1:
+        return
     await update_room(client, tid)
     await reply_to_room(client, tid, tr['seller'], T(tr['seller'], 'ping_fiat'))
     await audit(client, tid, 'FIAT CONFIRMED (buyer pressed paid)')
@@ -1776,7 +2669,14 @@ async def do_fiat(client, uid, tid):
 async def do_release(client, uid, tid):
     """Seller releases: escrow pays buyer's wallet; fee sweeps to owner."""
     tr = get_trade(tid)
-    if not tr or tr['stage'] != ST_FIAT or uid != tr['seller']:
+    if not tr or tr['stage'] != ST_FIAT or uid != tr['seller'] or not tr['escrow_verified'] or (tr['safety_version'] or 0) < 1:
+        await notify(client, uid, T(uid, 'no_action'))
+        return
+    # atomic claim: only ONE money-moving path may own this trade — a second
+    # click, a replayed callback, or a racing cancel can never double-send
+    cur = _exec("UPDATE trades SET stage=?, cancel_seller=0, cancel_buyer=0, updated=? "
+                "WHERE id=? AND stage=? AND escrow_verified=1 AND COALESCE(safety_version,0)>=1", (ST_PAYOUT, time.time(), tid, ST_FIAT))
+    if cur.rowcount != 1:
         await notify(client, uid, T(uid, 'no_action'))
         return
     await update_room(client, tid, note=T(uid, 'st_payout'), buttons=False)
@@ -1784,34 +2684,29 @@ async def do_release(client, uid, tid):
         dest = await spark_address_of(tr['buyer'])
     except Exception as e:
         logging.error(f'p2p payout: buyer wallet unreachable #{tid}: {e}')
+        _exec("UPDATE trades SET stage=?, updated=? WHERE id=? AND stage=?",
+              (ST_FIAT, time.time(), tid, ST_PAYOUT))
         await update_room(client, tid)
         await notify(client, admin_id(), f'⚠️ p2p #{tid}: buyer wallet unreachable — payout parked')
         return
-    ok, pid, err = await send_sats_from_escrow(dest, tr['sats'], f'payout#{tid}')
+    ok, pid, err = await send_sats_from_escrow(dest, payout_amount_of(tr), f'payout#{tid}')
     if ok == 'PENDING' or (ok is True):
-        _exec('UPDATE trades SET stage=?, payout_id=?, updated=? WHERE id=?',
-              (ST_PAYOUT, pid, time.time(), tid))
-        await reply_to_room(client, tid, tr['buyer'], T(tr['buyer'], 'ping_release'),
-                            buttons=[[_btn(T(tr['buyer'], 'room_close'), f'p2p:close:{tid}')]])
-        if ok is True:
-            await finish_payout(tid)
+        _bind_escrow_send(tid, pid, True)
+        await reconcile_escrow_send(pid)
     else:
         logging.error(f'p2p payout send failed #{tid}: {err}')
+        # Once a send is attempted its outcome may be unknown; never reopen it.
         _spark_addr.pop(tr['buyer'], None)
-        await update_room(client, tid)
-        await notify(client, admin_id(), f'⚠️ p2p #{tid}: payout failed ({str(err)[:80]})')
+        await notify(client, admin_id(), f'⚠️ p2p #{tid}: payout outcome uncertain ({str(err)[:80]}); manual reconciliation required')
 
 
 _rate_msgs = {}   # (tid, uid) -> (chat_id, msg_id)
 
 
 async def finish_payout(tid):
-    tr = get_trade(tid)
-    if not tr or tr['stage'] != ST_PAYOUT:
+    tr = _complete_escrow_trade(tid, True)
+    if not tr:
         return
-    _exec("UPDATE trades SET stage='done', updated=? WHERE id=? AND stage=?",
-          (time.time(), tid, ST_PAYOUT))
-    _exec("UPDATE orders SET status='done' WHERE id=?", (tr['order_id'],))
     b = _bot()
     await update_room(b.client, tid)
     other = {tr['buyer']: tr['seller'], tr['seller']: tr['buyer']}
@@ -1831,13 +2726,16 @@ async def finish_payout(tid):
 
 async def request_cancel(client, uid, tid):
     tr = get_trade(tid)
-    if not tr or tr['stage'] not in (ST_LOCKING, ST_LOCKED, ST_FIAT):
+    if not tr or uid not in (tr['buyer'], tr['seller']) or tr['stage'] not in (ST_LOCKING, ST_LOCKED, ST_FIAT):
         await notify(client, uid, T(uid, 'no_action'))
         return
     other = tr['buyer'] if uid == tr['seller'] else tr['seller']
     if tr['stage'] == ST_LOCKING:
-        # pre-lock: nothing in escrow — one-sided cancel is safe
-        _exec("UPDATE trades SET stage=?, updated=? WHERE id=?", (ST_CANCELED, time.time(), tid))
+        cur = _exec('UPDATE trades SET stage=?, updated=? WHERE id=? AND stage=? AND COALESCE(safety_version,0)>=1 AND COALESCE(lock_sent,0)=0',
+                    (ST_CANCELED, time.time(), tid, ST_LOCKING))
+        if cur.rowcount != 1:
+            await notify(client, uid, T(uid, 'lock_held'))
+            return
         _exec("UPDATE orders SET status='canceled' WHERE id=?", (tr['order_id'],))
         await audit(client, tid, f'CANCELED (one-sided pre-lock) by {uid}')
         await channel_status(tr['order_id'], '⛔️ لغو شد', delete=True)
@@ -1845,56 +2743,64 @@ async def request_cancel(client, uid, tid):
         await notify(client, other, T(other, 'cx_solo'))
         await update_room(client, tid)
         return
+    if tr['stage'] == ST_LOCKED and uid == tr['seller'] and time.time() - (tr.get('locked_at') or tr.get('updated') or tr.get('created') or 0) >= FIAT_TIMEOUT_SECS:
+        await timeout_dispute(client, tr, time.time(), FIAT_TIMEOUT_SECS)
+        return
     col = 'cancel_seller' if uid == tr['seller'] else 'cancel_buyer'
-    _exec(f'UPDATE trades SET {col}=1, updated=? WHERE id=?', (time.time(), tid))
+    cur = _exec(f'UPDATE trades SET {col}=1 WHERE id=? AND stage=?', (tid, tr['stage']))
+    if cur.rowcount != 1:
+        return
     tr = get_trade(tid)
-    if tr['cancel_seller'] and tr['cancel_buyer']:
-        await start_refund(client, tid)
+    if tr['stage'] in (ST_LOCKED, ST_FIAT) and tr['cancel_seller'] and tr['cancel_buyer']:
+        await start_refund(client, tid, expected_stage=tr['stage'], require_votes=True)
     else:
         await notify(client, other, T(other, 'cx_req'))
         await update_room(client, tid)
 
 
-async def start_refund(client, tid):
+async def start_refund(client, tid, expected_stage=None, timeout_before=None, require_votes=False):
     tr = get_trade(tid)
-    if not tr or tr['stage'] not in (ST_LOCKING, ST_LOCKED, ST_FIAT, ST_REFUND):
+    if not tr or tr['stage'] not in (ST_LOCKED, ST_FIAT) or not tr['escrow_verified'] or (tr['safety_version'] or 0) < 1:
         return
-    if tr['stage'] == ST_LOCKING:
-        # nothing confirmed locked yet — just cancel; escrow listener refunds
-        # any in-flight lock that lands (matched amount, no active lock left)
-        _exec("UPDATE trades SET stage=?, updated=? WHERE id=?",
-              (ST_CANCELED, time.time(), tid))
-        _exec("UPDATE orders SET status='canceled' WHERE id=?", (tr['order_id'],))
-        await audit(client, tid, 'CANCELED (mutual)')
-        await channel_status(tr['order_id'], '⛔️ لغو شد', delete=True)
-        await update_room(client, tid)
+    expected_stage = expected_stage or tr['stage']
+    sql = 'UPDATE trades SET stage=?, updated=? WHERE id=? AND stage=? AND escrow_verified=1 AND COALESCE(safety_version,0)>=1'
+    args = [ST_REFUND, time.time(), tid, expected_stage]
+    if timeout_before is not None:
+        # A deadline is never evidence that fiat was not sent.
+        return
+    if require_votes:
+        sql += ' AND cancel_seller=1 AND cancel_buyer=1'
+    if _exec(sql, args).rowcount != 1:
         return
     try:
         dest = await spark_address_of(tr['seller'])
     except Exception as e:
         logging.error(f'p2p refund: seller wallet unreachable #{tid}: {e}')
-        _exec("UPDATE trades SET stage='refunding', updated=? WHERE id=?", (time.time(), tid))
+        cur = _exec("UPDATE trades SET stage=?, updated=? WHERE id=? AND stage=?",
+                    (ST_REFUND, time.time(), tid, ST_REFUND))
+        if cur.rowcount != 1:
+            logging.warning(f'p2p refund park skipped #{tid}: stage changed concurrently')
+            return
         await notify(client, admin_id(), f'⚠️ p2p #{tid}: refund parked (seller wallet unreachable)')
         return
-    ok, pid, err = await send_sats_from_escrow(dest, tr['sats'] + tr['fee'], f'refund#{tid}')
+    ok, pid, err = await send_sats_from_escrow(dest, refund_amount_of(tr), f'refund#{tid}')
     if ok == 'PENDING' or (ok is True):
-        _exec('UPDATE trades SET stage=?, refund_id=?, updated=? WHERE id=?',
-              (ST_REFUND, pid, time.time(), tid))
-        _exec("UPDATE orders SET status='canceled' WHERE id=?", (tr['order_id'],))
-        await channel_status(tr['order_id'], '↩️ برگشت خورد')
-        if ok is True:
-            await finish_refund(tid)
+        _bind_escrow_send(tid, pid, False)
+        await reconcile_escrow_send(pid)
     else:
-        _exec("UPDATE trades SET stage='refunding', updated=? WHERE id=?", (time.time(), tid))
+        cur = _exec("UPDATE trades SET stage=?, updated=? WHERE id=? AND stage=?",
+                    (ST_REFUND, time.time(), tid, ST_REFUND))
+        if cur.rowcount != 1:
+            logging.warning(f'p2p refund park skipped #{tid}: stage changed concurrently')
+            return
         await notify(client, admin_id(), f'⚠️ p2p #{tid}: refund failed ({str(err)[:80]})')
 
 
 async def finish_refund(tid):
-    tr = get_trade(tid)
-    if not tr or tr['stage'] != ST_REFUND:
+    tr = _complete_escrow_trade(tid, False)
+    if not tr:
         return
-    _exec("UPDATE trades SET stage='refunded', updated=? WHERE id=? AND stage=?",
-          (time.time(), tid, ST_REFUND))
+    await channel_status(tr['order_id'], T(tr['seller'], 'refunded_channel'))
     b = _bot()
     await update_room(b.client, tid)
     await audit(b.client, tid, 'REFUNDED (sats returned to seller)')
@@ -1910,19 +2816,38 @@ async def finish_refund(tid):
     logging.info(f'p2p trade #{tid} REFUNDED')
 
 
+async def timeout_dispute(client, tr, now, seconds):
+    # Read the clock only after acquiring the same lock that serializes writes.
+    with _db_lock:
+        now = time.time()
+        cur = _exec("UPDATE trades SET stage=?, dispute_reason=?, updated=?, cancel_seller=0, cancel_buyer=0 "
+                    "WHERE id=? AND stage=? AND COALESCE(locked_at,updated,created) <= ?",
+                    (ST_DISPUTED, 'Fiat payment unconfirmed at deadline; verify with both parties',
+                     now, tr['id'], ST_LOCKED, now - seconds))
+    if cur.rowcount != 1:
+        return
+    await update_room(client, tr['id'])
+    for party in (tr['buyer'], tr['seller']):
+        await notify(client, party, T(party, 'fiat_timeout_dispute'))
+    await admin_case(client, tr['id'], auto=True)
+
+
 async def open_dispute(client, uid, tid, reason=None):
     tr = get_trade(tid)
     # dispute only makes sense once the escrow is actually funded (lock paid)
-    if not tr or tr['stage'] not in (ST_LOCKED, ST_FIAT, ST_PAYOUT, ST_DISPUTED):
+    if not tr or uid not in (tr['buyer'], tr['seller']) or tr['stage'] not in (ST_LOCKED, ST_FIAT, ST_DISPUTED):
         await notify(client, uid, T(uid, 'dispute_not_locked'))
-        return
+        return False
     prev = (tr.get('dispute_reason') or '').strip()
     merged = f'{prev}\n—\n{reason}' if prev and reason else (reason or prev or '')
-    _exec("UPDATE trades SET stage='disputed', dispute_reason=?, updated=? WHERE id=?",
-          (merged, time.time(), tid))
+    cur = _exec("UPDATE trades SET stage='disputed', dispute_reason=?, updated=?, cancel_seller=0, cancel_buyer=0 WHERE id=? AND stage=?",
+                (merged, time.time(), tid, tr['stage']))
+    if cur.rowcount != 1:
+        return False
     await audit(client, tid, f'DISPUTE FILED by {uid}', f'📝 {(merged or "")[:200]}')
     await update_room(client, tid)
     await admin_case(client, tid, auto=False)
+    return True
 
 
 def user_link(uid):
@@ -1940,7 +2865,7 @@ async def username_line(uid):
             return f'@{un}'
         # no username: nudge once per trade party
         try:
-            await b.client.send_message(uid, '⚠️ برای استفاده از بخش P2P یه یوزرنیم تلگرام ست کن (تنظیمات تلگرام → Username).')
+            await b.client.send_message(uid, T(uid, 'username_nudge'))
         except Exception:
             pass
     except Exception as e:
@@ -1957,20 +2882,19 @@ async def admin_case(client, tid, auto=False):
         return
     buyer_un = await username_line(tr['buyer'])
     seller_un = await username_line(tr['seller'])
-    st = 'قفل' if tr['stage'] in (ST_LOCKED,) else tr['stage']
-    reason = f'\n📝 {_h(tr["dispute_reason"])}' if tr.get('dispute_reason') else ''
-    auto_line = '\n⏰ خودکار (۲۴ ساعت)' if auto else ''
-    text = (f'⚖️ پرونده p2p #{tid}{auto_line}\n\n'
-            f'🛒 خریدار: {_h(buyer_un)} · {user_link(tr["buyer"])}\n\n'
-            f'💸 فروشنده: {_h(seller_un)} · {user_link(tr["seller"])}\n\n'
-            f'💰 {fmt(tr["sats"])} sats (+{fmt(tr["fee"])} کارمزد)\n'
-            f'🏷 {_h(tr["price"])}\n'
-            f'📌 مرحله: {_h(st)}{reason}')
-    buttons = [[_btn('✅ آزادسازی', f'p2p:admrel:{tid}'),
-                _btn('↩️ برگشت', f'p2p:admref:{tid}')],
-               [_btn('💬 خلاصه چت', f'p2p:admchat:{tid}')]]
     b = _bot()
     for adm in admins:
+        st = T(adm, 'adm_stage_locked') if tr['stage'] in (ST_LOCKED,) else tr['stage']
+        reason = T(adm, 'adm_reason', reason=_h(tr["dispute_reason"])) if tr.get('dispute_reason') else ''
+        auto_line = T(adm, 'adm_auto') if auto else ''
+        text = T(adm, 'adm_case_text', id=tid, auto=auto_line,
+                 buyer=f'{_h(buyer_un)} · {user_link(tr["buyer"])}',
+                 seller=f'{_h(seller_un)} · {user_link(tr["seller"])}',
+                 sats=fmt(tr['sats']), fee=fmt(tr['fee']), price=_h(str(tr['price'] or '—')),
+                 stage=_h(st), reason=reason)
+        buttons = [[_btn(T(adm, 'adm_release_btn'), f'p2p:admrel:{tid}'),
+                    _btn(T(adm, 'adm_refund_btn'), f'p2p:admref:{tid}')],
+                   [_btn(T(adm, 'adm_chat_btn'), f'p2p:admchat:{tid}')]]
         try:
             await b.client.send_message(adm, text, buttons=buttons, parse_mode='html')
         except Exception as e:
@@ -1978,9 +2902,17 @@ async def admin_case(client, tid, auto=False):
     logging.info(f'p2p dispute case #{tid} -> {len(admins)} admin(s) (auto={auto})')
 
 
-async def admin_release(client, tid):
+async def admin_release(client, tid, legacy_ack=False, actor=None):
     tr = get_trade(tid)
-    if not tr or tr['stage'] not in (ST_DISPUTED, ST_FIAT, ST_LOCKED, ST_PAYOUT):
+    if legacy_ack and (not actor or not is_p2p_admin(actor)):
+        return
+    if not tr or tr['stage'] not in (ST_DISPUTED, ST_FIAT, ST_LOCKED) or not tr['escrow_verified'] or ((tr['safety_version'] or 0) < 1 and not legacy_ack):
+        await notify(client, admin_id(), T(admin_id(), 'no_action'))
+        return
+    cur = _exec("UPDATE trades SET stage=?, payout_id=NULL, updated=? "
+                "WHERE id=? AND stage=? AND escrow_verified=1 AND (COALESCE(safety_version,0)>=1 OR ?=1)",
+                (ST_PAYOUT, time.time(), tid, tr['stage'], int(legacy_ack)))
+    if cur.rowcount != 1:
         await notify(client, admin_id(), T(admin_id(), 'no_action'))
         return
     # force path: pay the buyer from escrow regardless of whose turn it is
@@ -1988,44 +2920,50 @@ async def admin_release(client, tid):
     try:
         dest = await spark_address_of(tr['buyer'])
     except Exception as e:
-        await notify(client, admin_id(), f'⚠️ p2p #{tid}: buyer wallet unreachable: {str(e)[:80]}')
+        await notify(client, admin_id(), T(admin_id(), 'adm_buyer_unreachable', id=tid, err=str(e)[:80]))
         return
-    ok, pid, err = await send_sats_from_escrow(dest, tr['sats'], f'adminpayout#{tid}')
+    ok, pid, err = await send_sats_from_escrow(dest, payout_amount_of(tr), f'adminpayout#{tid}')
     if ok == 'PENDING' or (ok is True):
-        _exec('UPDATE trades SET stage=?, payout_id=?, updated=? WHERE id=?',
-              (ST_PAYOUT, pid, time.time(), tid))
-        if ok is True:
-            await finish_payout(tid)
+        _bind_escrow_send(tid, pid, True)
+        await reconcile_escrow_send(pid)
     else:
-        await notify(client, admin_id(), f'⚠️ p2p #{tid}: admin payout failed ({str(err)[:80]})')
+        await notify(client, admin_id(), T(admin_id(), 'adm_payout_failed', id=tid, err=str(err)[:80]))
 
 
-async def admin_refund(client, tid):
+async def admin_refund(client, tid, legacy_ack=False, actor=None):
     tr = get_trade(tid)
-    if not tr:
+    if legacy_ack and (not actor or not is_p2p_admin(actor)):
+        return
+    if not tr or not tr['escrow_verified'] or ((tr['safety_version'] or 0) < 1 and not legacy_ack):
         return
     if tr['stage'] in (ST_DONE, ST_REFUNDED, ST_CANCELED):
         await notify(client, admin_id(), T(admin_id(), 'no_action'))
         return
-    if tr['stage'] == ST_DISPUTED:
-        # start_refund skips disputed — force the refund here (seller gets sats+fee)
+    if tr['stage'] in (ST_DISPUTED, ST_LOCKED, ST_FIAT):
+        # Claim directly, including explicitly acknowledged legacy cases.
+        cur = _exec("UPDATE trades SET stage=?, refund_id=NULL, updated=? "
+                    "WHERE id=? AND stage=? AND escrow_verified=1 AND (COALESCE(safety_version,0)>=1 OR ?=1)",
+                    (ST_REFUND, time.time(), tid, tr['stage'], int(legacy_ack)))
+        if cur.rowcount != 1:
+            await notify(client, admin_id(), T(admin_id(), 'no_action'))
+            return
         await update_room(client, tid, buttons=False)
         try:
             dest = await spark_address_of(tr['seller'])
         except Exception as e:
-            await notify(client, admin_id(), f'⚠️ p2p #{tid}: seller wallet unreachable: {str(e)[:80]}')
+            await notify(client, admin_id(), T(admin_id(), 'adm_seller_unreachable', id=tid, err=str(e)[:80]))
             return
-        ok, pid, err = await send_sats_from_escrow(dest, tr['sats'] + tr['fee'], f'adminrefund#{tid}')
+        ok, pid, err = await send_sats_from_escrow(dest, refund_amount_of(tr), f'adminrefund#{tid}')
         if ok == 'PENDING' or (ok is True):
-            _exec('UPDATE trades SET stage=?, refund_id=?, updated=? WHERE id=?',
-                  (ST_REFUND, pid, time.time(), tid))
-            _exec("UPDATE orders SET status='canceled' WHERE id=?", (tr['order_id'],))
-            await channel_status(tr['order_id'], '↩️ برگشت خورد')
-            if ok is True:
-                await finish_refund(tid)
+            _bind_escrow_send(tid, pid, False)
+            await reconcile_escrow_send(pid)
             return
-        _exec("UPDATE trades SET stage='refunding', updated=? WHERE id=?", (time.time(), tid))
-        await notify(client, admin_id(), f'⚠️ p2p #{tid}: refund failed ({str(err)[:80]})')
+        cur = _exec("UPDATE trades SET stage=?, updated=? WHERE id=? AND stage=?",
+                    (ST_REFUND, time.time(), tid, ST_REFUND))
+        if cur.rowcount != 1:
+            logging.warning(f'p2p admin refund park skipped #{tid}: stage changed concurrently')
+            return
+        await notify(client, admin_id(), T(admin_id(), 'adm_refund_failed', id=tid, err=str(err)[:80]))
         return
     await start_refund(client, tid)
 
@@ -2049,13 +2987,15 @@ async def sweep(client):
         if now - o['created'] > o['ttl_secs']:
             _exec("UPDATE orders SET status='expired' WHERE id=? AND status='open'", (o['id'],))
             await audit(client, 0, 'ORDER EXPIRED', f'🆔 order #{o["id"]} · maker {o["maker"]}')
-            await channel_status(o['id'], '⏳ منقضی شد', delete=True)
-            await notify(client, o['maker'], f'⏳ سفارش #{o["id"]} مهلتش تموم شد و از بازار برداشته شد.')
+            await channel_status(o['id'], T(o['maker'], 'expired_channel'), delete=True)
+            await notify(client, o['maker'], T(o['maker'], 'expired_notify', id=o['id']))
     # 1) taken but never locked
     for tr in _rows('SELECT * FROM trades WHERE stage=?', (ST_LOCKING,)):
         if now - (tr['lock_started'] or tr['created']) > LOCK_WAIT_SECS:
-            _exec("UPDATE trades SET stage='canceled', updated=? WHERE id=? AND stage=?",
-                  (now, tr['id'], ST_LOCKING))
+            cur = _exec("UPDATE trades SET stage='canceled', updated=? WHERE id=? AND stage=? AND COALESCE(safety_version,0)>=1 AND COALESCE(lock_sent,0)=0 AND COALESCE(lock_started,created) <= ?",
+                        (now, tr['id'], ST_LOCKING, now - LOCK_WAIT_SECS))
+            if cur.rowcount != 1:
+                continue
             _exec("UPDATE orders SET status='open', taken_at=NULL WHERE id=? AND status='taken'",
                   (tr['order_id'],))
             await channel_repost(tr['order_id'])
@@ -2069,55 +3009,47 @@ async def sweep(client):
                 # buy order: taker seller flaked, maker buyer waited in vain
                 await notify(client, maker, T(maker, 'order_back_buy'))
                 await notify(client, tr['seller'], T(tr['seller'], 'lock_timeout_self'))
-    # 2) locked, buyer silent
-    for tr in _rows('SELECT * FROM trades WHERE stage=? AND warned=0', (ST_LOCKED,)):
-        if now - tr['updated'] > FIAT_TIMEOUT_SECS:
-            _exec('UPDATE trades SET warned=1 WHERE id=?', (tr['id'],))
-            for party in (tr['buyer'], tr['seller']):
-                await notify(client, party, T(party, 'fiat_warn'))
+    # 2) Buyer silence is not proof of non-payment.
+    for tr in _rows('SELECT * FROM trades WHERE stage=?', (ST_LOCKED,)):
+        locked_at = tr.get('locked_at') or tr.get('updated') or tr.get('created') or now
+        if now - locked_at >= FIAT_TIMEOUT_SECS * 2:
+            await timeout_dispute(client, tr, now, FIAT_TIMEOUT_SECS * 2)
+        elif tr['warned'] == 0 and now - locked_at >= FIAT_TIMEOUT_SECS:
+            cur = _exec('UPDATE trades SET warned=1 WHERE id=? AND stage=? AND warned=0 '
+                        'AND COALESCE(locked_at,updated,created) <= ?',
+                        (tr['id'], ST_LOCKED, now - FIAT_TIMEOUT_SECS))
+            if cur.rowcount:
+                for party in (tr['buyer'], tr['seller']):
+                    await notify(client, party, T(party, 'fiat_warn'))
     # 3) fiat confirmed, seller silent -> auto dispute
     for tr in _rows('SELECT * FROM trades WHERE stage=?', (ST_FIAT,)):
         if tr['fiat_at'] and now - tr['fiat_at'] > RELEASE_TIMEOUT_SECS:
-            _exec("UPDATE trades SET stage='disputed', updated=? WHERE id=? AND stage=?",
-                  (now, tr['id'], ST_FIAT))
+            cur = _exec("UPDATE trades SET stage='disputed', updated=?, cancel_seller=0, cancel_buyer=0 WHERE id=? AND stage=?",
+                        (now, tr['id'], ST_FIAT))
+            if cur.rowcount != 1:
+                continue
             await update_room(client, tr['id'])
             for party in (tr['buyer'], tr['seller']):
                 await notify(client, party, T(party, 'auto_dispute'))
             await admin_case(client, tr['id'], auto=True)
+    # Replay and alerts do not depend on wallet connectivity.
+    await replay_escrow_journal()
     # 4) payout/refund in flight — check escrow ledger (send-side bookkeeping)
     try:
         async def _lp():
             sdk = await escrow_sdk()
             return await sdk.list_payments(request=_bot().ListPaymentsRequest(limit=50))
         resp = await offloop(_lp())
-        by_id = {getattr(p, 'id', ''): p for p in (getattr(resp, 'payments', []) or [])}
-        for tr in _rows('SELECT * FROM trades WHERE stage IN (?,?)', (ST_PAYOUT, ST_REFUND)):
-            pid = tr['payout_id'] if tr['stage'] == ST_PAYOUT else tr['refund_id']
-            p = by_id.get(pid or '')
-            if p is None:
-                continue
-            status = str(getattr(p, 'status', ''))
-            if 'COMPLETED' in status:
-                if tr['stage'] == ST_PAYOUT:
-                    await finish_payout(tr['id'])
-                else:
-                    await finish_refund(tr['id'])
-            elif 'FAILED' in status:
-                tries = (tr['payout_tries'] if tr['stage'] == ST_PAYOUT else tr['refund_tries']) + 1
-                col = 'payout_tries' if tr['stage'] == ST_PAYOUT else 'refund_tries'
-                _exec(f'UPDATE trades SET {col}=? WHERE id=?', (tries, tr['id']))
-                if tr['stage'] == ST_PAYOUT and tries <= 2:
-                    await admin_release(client, tr['id'])  # retry once via force path
-                else:
-                    await notify(client, admin_id(),
-                                 f'⚠️ p2p #{tr["id"]}: {"payout" if tr["stage"] == ST_PAYOUT else "refund"} '
-                                 f'FAILED on network — manual action needed')
+        for payment in getattr(resp, 'payments', []) or []:
+            if _payment_is_sats(payment):
+                await on_escrow_payment(str(getattr(payment, 'payment_type', '')),
+                    getattr(payment, 'amount_sats', getattr(payment, 'amount', 0)) or 0,
+                    getattr(payment, 'id', ''), str(getattr(payment, 'status', '')))
+        for row in _rows("SELECT payment_id FROM escrow_events WHERE direction='SEND' AND status='COMPLETED' AND conflict=0"):
+            await reconcile_escrow_send(row['payment_id'])
     except Exception as e:
         logging.debug(f'p2p sweep ledger check: {e}')
-    # 5) retry unpaid fees (best-effort, capped)
-    for tr in _rows('SELECT * FROM trades WHERE stage=? AND fee_paid=0 AND fee_tries<?',
-                    (ST_DONE, FEE_MAX_TRIES)):
-        await sweep_fee_to_owner(tr)
+    # Automatic fee sends are disabled, including for pre-existing DONE trades.
 
 
 # ==================== boot ====================
@@ -2125,9 +3057,10 @@ async def sweep(client):
 async def boot(client):
     init_db()
     if not enabled_for_all():
-        logging.info('p2p: no test users configured — module idle')
+        logging.info('p2p: no public access or valid allowlist users — module idle')
         return
     if not os.path.exists(ESCROW_SEED_PATH):
+        await replay_escrow_journal()
         logging.warning('p2p: escrow seed missing — section disabled')
         return
     try:
@@ -2136,13 +3069,23 @@ async def boot(client):
         logging.info('p2p section booted')
     except Exception as e:
         logging.error(f'p2p boot failed: {e}')
+        await replay_escrow_journal()
 
 
 def enabled_for_all():
-    return bool(test_users())
+    return p2p_public() or bool(test_users())
 
 
 # ==================== admin panel ====================
+# Shared row filters so the panel counts always match the paged listings.
+HOLDS_WHERE = ("((stage='locking' AND (lock_sent=1 OR COALESCE(safety_version,0)=0)) "
+               "OR stage IN ('payout','refunding','invalidated') "
+               "OR (stage IN ('locked','fiat_sent','disputed') "
+               "AND (COALESCE(escrow_verified,0)=0 OR COALESCE(safety_version,0)<1)) "
+               "OR (stage='done' AND COALESCE(fee_paid,0)=0 AND COALESCE(fee,0)>0))")
+EVENTS_WHERE = "(direction='RECEIVE' OR conflict=1 OR status='FAILED')"
+
+
 def p2p_stats():
     def c(sql):
         r = _one(sql)
@@ -2156,42 +3099,64 @@ def p2p_stats():
         'fees': fees,
         'open_orders': c("SELECT COUNT(*) AS c FROM orders WHERE status='open'"),
         'disputes': c("SELECT COUNT(*) AS c FROM trades WHERE stage='disputed'"),
+        'holds': c(f"SELECT COUNT(*) AS c FROM trades WHERE {HOLDS_WHERE}"),
+        'events': c(f"SELECT COUNT(*) AS c FROM escrow_events WHERE {EVENTS_WHERE}"),
         'banned': c('SELECT COUNT(*) AS c FROM banned'),
         'admins': len(p2p_admin_ids()),
     }
 
 
-def chat_summary(tid, limit=30, trunc=200):
+def chat_summary(tid, limit=30, trunc=200, uid=None):
+    who = uid if uid is not None else admin_id()
     rows = _rows('SELECT * FROM chat_msgs WHERE tid=? ORDER BY id DESC LIMIT ?', (tid, limit))
     if not rows:
-        return '💬 بین طرفین پیامی رد و بدل نشده (یا چت خاموش بوده).'
+        return T(who, 'adm_chat_empty')
     rows = list(reversed(rows))
     tr = get_trade(tid)
     seller = tr['seller'] if tr else None
-    lines = [f'📋 چت معاوضه #{tid} — {len(rows)} پیام اخیر:']
+    lines = [T(who, 'adm_chat_title', id=tid, n=len(rows))]
     for r in rows:
-        who = '💸 فروشنده' if r['uid'] == seller else '🛒 خریدار'
+        role = T(who, 'adm_chat_seller') if r['uid'] == seller else T(who, 'adm_chat_buyer')
         t = r['text'] or ''
         if len(t) > trunc:
             t = t[:trunc] + '…'
-        lines.append(f'{who}: {t}')
+        lines.append(f'{role}: {t}')
     return '\n'.join(lines)
+
+
+def _hold_conflict_lines(tr, attempt=None):
+    """Read-only conflict evidence bound to this trade's payment IDs (if any)."""
+    pids = [pid for pid in (tr.get('lock_pay_id'), tr.get('payout_id'), tr.get('refund_id'),
+                            (attempt or {}).get('payment_id')) if pid]
+    if not pids:
+        return []
+    q = ','.join('?' for _ in pids)
+    lines = []
+    for ev in _rows(f'SELECT * FROM escrow_events WHERE payment_id IN ({q}) AND conflict=1', pids):
+        obs = _rows('SELECT direction,amount,status FROM escrow_observations '
+                    'WHERE event_id=? ORDER BY observed_at', (ev['id'],))
+        obs_txt = ' | '.join(f'{o["direction"]} {o["amount"]} {o["status"]}' for o in obs) or '—'
+        lines.append(f'#{ev["id"]} {ev["payment_id"]}: {obs_txt}')
+    return lines
 
 
 async def admin_panel(client, uid, edit_event=None):
     st = p2p_stats()
-    text = ('🛡 پنل ادمین P2P\n\n'
-            '📊 آمار:\n'
-            f'• معاوضه‌ها: {st["trades"]} (تموم‌شده: {st["done"]})\n'
-            f'• کاربرای معامله‌کننده: {st["users"]}\n'
-            f'• کارمزدهای جمع‌شده: {fmt(st["fees"])} sats\n'
-            f'• سفارش‌های باز بازار: {st["open_orders"]}\n'
-            f'• اختلاف‌های باز: {st["disputes"]}\n'
-            f'• بن‌شده‌ها: {st["banned"]} · ادمین‌ها: {st["admins"]}')
+    text = (T(uid, 'adm_panel_title') + '\n'
+            + T(uid, 'adm_st_trades', trades=st['trades'], done=st['done']) + '\n'
+            + T(uid, 'adm_st_users', users=st['users']) + '\n'
+            + T(uid, 'adm_st_fees', fees=fmt(st['fees'])) + '\n'
+            + T(uid, 'adm_st_orders', orders=st['open_orders']) + '\n'
+            + T(uid, 'adm_st_disputes', disputes=st['disputes']) + '\n'
+            + T(uid, 'adm_st_mod', banned=st['banned'], admins=st['admins']))
+    def _badge(label, n):
+        return f'{label} ({n})' if n else label
     buttons = [
-        [_btn('⚖️ اختلاف‌های باز', 'p2p:adm:disputes')],
-        [_btn('🚫 بن کاربر', 'p2p:adm:ban'), _btn('📜 بن‌شده‌ها', 'p2p:adm:banlist')],
-        [_btn('👥 ادمین‌های داوری', 'p2p:adm:admins')],
+        [_btn(_badge(T(uid, 'adm_disputes_btn'), st['disputes']), 'p2p:adm:disputes')],
+        [_btn(_badge(T(uid, 'events_panel'), st['events']), 'p2p:admevents:0')],
+        [_btn(_badge(T(uid, 'holds_panel'), st['holds']), 'p2p:admholds:0')],
+        [_btn(T(uid, 'adm_ban_btn'), 'p2p:adm:ban'), _btn(T(uid, 'adm_banlist_btn'), 'p2p:adm:banlist')],
+        [_btn(T(uid, 'adm_admins_btn'), 'p2p:adm:admins')],
         [_btn(T(uid, 'back_p2p'), 'p2p:home')],
     ]
     if edit_event is not None:
@@ -2203,11 +3168,11 @@ async def admin_panel(client, uid, edit_event=None):
 async def admin_disputes(client, uid, edit_event=None):
     rows = _rows("SELECT * FROM trades WHERE stage='disputed' ORDER BY updated DESC LIMIT 20")
     if not rows:
-        text, buttons = '✅ اختلاف بازی وجود نداره.', [[_btn('« پنل', 'p2p:adm')]]
+        text, buttons = T(uid, 'adm_disputes_empty'), [[_btn(T(uid, 'admin_back'), 'p2p:adm')]]
     else:
-        text = f'⚖️ اختلاف‌های باز ({len(rows)}):'
-        buttons = [[_btn(f'#{r["id"]} · {fmt(r["sats"])}s', f'p2p:admcase:{r["id"]}')] for r in rows]
-        buttons.append([_btn('« پنل', 'p2p:adm')])
+        text = T(uid, 'adm_disputes_title', n=len(rows))
+        buttons = [[_btn(f'#{r["id"]} · {fmt(r["sats"])}s', f'p2p:admcase:{r["id"]}]')] for r in rows]
+        buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
     if edit_event is not None:
         await edit_event.edit(text, buttons=buttons)
     else:
@@ -2217,15 +3182,15 @@ async def admin_disputes(client, uid, edit_event=None):
 async def admin_banlist(client, uid, edit_event=None):
     rows = _rows('SELECT * FROM banned ORDER BY at DESC LIMIT 30')
     if not rows:
-        text, buttons = '🚫 هیچ‌کی بن نشده.', [[_btn('« پنل', 'p2p:adm')]]
+        text, buttons = T(uid, 'adm_banlist_empty'), [[_btn(T(uid, 'admin_back'), 'p2p:adm')]]
     else:
-        text = f'🚫 بن‌شده‌ها ({len(rows)}):'
+        text = T(uid, 'adm_banlist_title', n=len(rows))
         buttons = []
         for r in rows:
             reason = f' — {r["reason"]}' if r['reason'] else ''
             text += f'\n• {r["uid"]}{reason}'
-            buttons.append([_btn(f'♻️ رفع بن {r["uid"]}', f'p2p:adm:unban:{r["uid"]}')])
-        buttons.append([_btn('« پنل', 'p2p:adm')])
+            buttons.append([_btn(T(uid, 'adm_unban_btn', target=r['uid']), f'p2p:adm:unban:{r["uid"]}')])
+        buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
     if edit_event is not None:
         await edit_event.edit(text, buttons=buttons)
     else:
@@ -2234,15 +3199,15 @@ async def admin_banlist(client, uid, edit_event=None):
 
 async def admin_admins(client, uid, edit_event=None):
     ids = p2p_admin_ids()
-    text = '👥 ادمین‌های داوری:\n' + '\n'.join(
-        f'• {i}' + (' (مالک)' if i == admin_id() else '') for i in ids)
+    text = T(uid, 'adm_admins_title') + '\n' + '\n'.join(
+        f'• {i}' + (T(uid, 'adm_owner_tag') if i == admin_id() else '') for i in ids)
     buttons = []
     if uid == admin_id():
-        buttons.append([_btn('➕ افزودن ادمین', 'p2p:adm:admadd')])
+        buttons.append([_btn(T(uid, 'adm_add_btn'), 'p2p:adm:admadd')])
         for i in ids:
             if i != admin_id():
-                buttons.append([_btn(f'❌ حذف {i}', f'p2p:adm:admdel:{i}')])
-    buttons.append([_btn('« پنل', 'p2p:adm')])
+                buttons.append([_btn(T(uid, 'adm_del_btn', target=i), f'p2p:adm:admdel:{i}')])
+    buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
     if edit_event is not None:
         await edit_event.edit(text, buttons=buttons)
     else:
@@ -2252,38 +3217,104 @@ async def admin_admins(client, uid, edit_event=None):
 async def admin_case_view(client, uid, tid, edit_event=None):
     tr = get_trade(tid)
     if not tr:
-        text, buttons = 'پرونده پیدا نشد.', [[_btn('« پنل', 'p2p:adm')]]
+        text, buttons = T(uid, 'adm_case_missing'), [[_btn(T(uid, 'admin_back'), 'p2p:adm')]]
     else:
         buyer_un = await username_line(tr['buyer'])
         seller_un = await username_line(tr['seller'])
-        reason = f'\n📝 {_h(tr["dispute_reason"])}' if tr.get('dispute_reason') else ''
-        text = (f'⚖️ پرونده #{tid}\n\n'
-                f'🛒 خریدار: {_h(buyer_un)} · {user_link(tr["buyer"])}\n'
-                f'💸 فروشنده: {_h(seller_un)} · {user_link(tr["seller"])}\n\n'
-                f'💰 {fmt(tr["sats"])} sats (+{fmt(tr["fee"])} کارمزد)\n'
-                f'🏷 {_h(tr["price"])}\n'
-                f'📌 مرحله: {_h(tr["stage"])}{reason}\n\n'
-                + _h(chat_summary(tid)))
-        buttons = [[_btn('✅ آزادسازی', f'p2p:admrel:{tid}'),
-                    _btn('↩️ برگشت', f'p2p:admref:{tid}')],
-                   [_btn('💬 چت کامل', f'p2p:admchat:{tid}'),
-                    _btn('« پنل', 'p2p:adm')]]
+        reason = T(uid, 'adm_reason', reason=_h(tr["dispute_reason"])) if tr.get('dispute_reason') else ''
+        text = T(uid, 'adm_case_view_text', id=tid,
+                 buyer=f'{_h(buyer_un)} · {user_link(tr["buyer"])}',
+                 seller=f'{_h(seller_un)} · {user_link(tr["seller"])}',
+                 sats=fmt(tr['sats']), fee=fmt(tr['fee']), price=_h(str(tr['price'] or '—')),
+                 stage=_h(tr['stage']), reason=reason,
+                 chat=_h(chat_summary(tid, uid=uid)))
+        buttons = [[_btn(T(uid, 'adm_release_btn'), f'p2p:admrel:{tid}'),
+                    _btn(T(uid, 'adm_refund_btn'), f'p2p:admref:{tid}')],
+                   [_btn(T(uid, 'adm_chat_full_btn'), f'p2p:admchat:{tid}'),
+                    _btn(T(uid, 'admin_back'), 'p2p:adm')]]
     if edit_event is not None:
         await edit_event.edit(text, buttons=buttons, parse_mode='html')
     else:
         await _send_panel(client, uid, text, buttons)
 
 
+def _home_rows(uid):
+    """Shared P2P home keyboard (single admin entry, in-progress badge)."""
+    rows = [[_btn(T(uid, 'market'), 'p2p:market'), _btn(T(uid, 'new_order'), 'p2p:new')]]
+    n = active_trade_count(uid)
+    if n:
+        rows.append([_btn(f'{T(uid, "active_title")} ({n})', 'p2p:active')])
+    rows.append([_btn(T(uid, 'my_orders'), 'p2p:mine'), _btn(T(uid, 'guide'), 'p2p:guide')])
+    if is_p2p_admin(uid):
+        rows.append([_btn(T(uid, 'admin_panel_btn'), 'p2p:adm')])
+    rows.append([_btn(T(uid, 'back_menu'), 'p2p:exit')])
+    return rows
+
+
 # ==================== routing: callbacks ====================
+
+async def _admin_gate(event, uid):
+    """Shared admin prelude for on_callback branches (item 25): alerts
+    non-admins with the admin_only popup. Returns True when the caller
+    must return immediately."""
+    if is_p2p_admin(uid):
+        return False
+    await event.answer(T(uid, 'admin_only'), alert=True)
+    return True
+
+
+async def _cb_rate(client, event, uid, data):
+    """p2p:rate:<tid>:<ratee>:<stars> — membership-gated rating save."""
+    await event.answer()
+    try:
+        _, _, tid, ratee, stars = data.split(':')
+        tid, ratee, stars = int(tid), int(ratee), int(stars)
+    except (ValueError, TypeError):
+        return  # forged callback data
+    # membership gate (IDOR fix): only a done trade's counterparty may be rated
+    tr = get_trade(tid)
+    if (not tr or uid not in (tr['buyer'], tr['seller'])
+            or ratee not in (tr['buyer'], tr['seller'])
+            or ratee == uid or tr['stage'] != ST_DONE):
+        return
+    await save_rating(client, uid, ratee, tid, stars)
+
+
+async def _cb_close(client, event, uid, data):
+    """p2p:close:<tid> — drop the closer's room panel + pin, kill chat."""
+    await event.answer()
+    try:
+        tid = int(data.split(':')[2])
+    except (ValueError, IndexError):
+        return  # forged callback data
+    tr = get_trade(tid)
+    if not tr or uid not in (tr['buyer'], tr['seller']):
+        return
+    # drop his panel (message + its pin) and kill his chat side
+    panels = json.loads(tr.get('panels') or '{}')
+    if str(uid) in panels:
+        chat_id, msg_id = panels[str(uid)]
+        try:
+            await client.delete_messages(chat_id, msg_id)
+        except Exception:
+            pass
+        await _del_pin_note(client, chat_id, msg_id)
+        panels.pop(str(uid), None)
+        _exec('UPDATE trades SET panels=? WHERE id=?', (json.dumps(panels), tid))
+    col = 'chat_off_seller' if uid == tr['seller'] else 'chat_off_buyer'
+    _exec(f'UPDATE trades SET {col}=1, chat_open=0 WHERE id=?', (tid,))
+    await notify(client, uid, T(uid, 'room_closed'))
+
 
 async def on_callback(client, event, data):
     uid = event.sender_id
     init_db()
-    if is_banned(uid):
-        await event.answer('🚫 دسترسی‌ات به P2P مسدود شده.', alert=True)
+    admin = is_p2p_admin(uid)
+    if is_banned(uid) and not admin:
+        await event.answer(T(uid, 'banned_answer'), alert=True)
         return
-    if not enabled_for(uid):
-        await event.answer('⚠️ P2P در حال تست است.')
+    if not admin and not enabled_for(uid):
+        await event.answer(T(uid, 'testing_answer'))
         return
 
     if data == 'p2p' or data == 'p2p:home':
@@ -2294,19 +3325,7 @@ async def on_callback(client, event, data):
             return
         text = (f'{T(uid, "home_title")}\n\n{T(uid, "home_body")}\n'
                 f'{T(uid, "home_fee")}')
-        n = active_trade_count(uid)
-        rows = [
-            [_btn(T(uid, 'market'), 'p2p:market'), _btn(T(uid, 'new_order'), 'p2p:new')],
-        ]
-        if n:
-            rows.append([_btn(f'{T(uid, "active_title")} ({n})', 'p2p:active')])
-        rows.append([_btn(T(uid, 'my_orders'), 'p2p:mine'), _btn(T(uid, 'guide'), 'p2p:guide')])
-        if is_p2p_admin(uid):
-            rows.append([_btn('🛡 پنل ادمین', 'p2p:adm')])
-        from telethon import Button as _B
-        rows.append([_B.url(T(uid, 'ch_join'), 'https://t.me/your_channel')])
-        rows.append([_btn(T(uid, 'back_menu'), 'p2p:exit')])
-        await event.edit(text, buttons=rows)
+        await event.edit(text, buttons=_home_rows(uid))
         return
 
     if data == 'p2p:agree':
@@ -2314,17 +3333,7 @@ async def on_callback(client, event, data):
         set_agreed(uid)
         text = (f'{T(uid, "home_title")}\n\n{T(uid, "home_body")}\n'
                 f'{T(uid, "home_fee")}')
-        n = active_trade_count(uid)
-        rows = [
-            [_btn(T(uid, 'market'), 'p2p:market'), _btn(T(uid, 'new_order'), 'p2p:new')],
-        ]
-        if n:
-            rows.append([_btn(f'{T(uid, "active_title")} ({n})', 'p2p:active')])
-        rows.append([_btn(T(uid, 'my_orders'), 'p2p:mine'), _btn(T(uid, 'guide'), 'p2p:guide')])
-        if is_p2p_admin(uid):
-            rows.append([_btn('🛡 پنل ادمین', 'p2p:adm')])
-        rows.append([_btn(T(uid, 'back_menu'), 'p2p:exit')])
-        await event.edit(text, buttons=rows)
+        await event.edit(text, buttons=_home_rows(uid))
         return
 
     if data == 'p2p:exit':
@@ -2356,24 +3365,28 @@ async def on_callback(client, event, data):
         mode = data.split(':')[2]
         w = _wiz.get(uid) or {}
         w['price_mode'] = mode
-        _wiz[uid] = w
         if mode == 'fixed' and w.get('unit') == 'toman' and w.get('fiat_amount'):
             # toman-seller manual price: ask how many SATS for his toman amount
             w['step'] = 'sats_price'
+            _wiz[uid] = w
             await event.edit(T(uid, 'wiz_sats_price'))
         elif mode == 'fixed':
             w['step'] = 'price'
+            _wiz[uid] = w
             await event.edit(T(uid, 'wiz_price'))
         elif mode == 'float' and w.get('unit') == 'sats':
             # sats + live rate: premium % adjusts the derived fiat value
             w['step'] = 'premium'
+            _wiz[uid] = w
             await event.edit(T(uid, 'wiz_premium'), buttons=_prem_buttons(uid))
         elif mode == 'float' and w.get('unit') == 'toman' and w.get('fiat_amount'):
             # toman + live rate: premium % on top of the market rate
             w['step'] = 'premium'
+            _wiz[uid] = w
             await event.edit(T(uid, 'wiz_premium'), buttons=_prem_buttons(uid))
         else:
             w['step'] = 'fiat_amount'
+            _wiz[uid] = w
             _rate, _fiat = await bot_fiat_rate(uid)
             fw = fiat_word(uid, _fiat)
             txt = T(uid, 'wiz_fiat_amount').replace('تومان', fw).replace('Toman', fw)
@@ -2382,31 +3395,11 @@ async def on_callback(client, event, data):
 
 
     if data.startswith('p2p:rate:'):
-        await event.answer()
-        _, _, tid, ratee, stars = data.split(':')
-        await save_rating(client, uid, int(ratee), int(tid), int(stars))
+        await _cb_rate(client, event, uid, data)
         return
 
     if data.startswith('p2p:close:'):
-        await event.answer()
-        tid = int(data.split(':')[2])
-        tr = get_trade(tid)
-        if not tr or uid not in (tr['buyer'], tr['seller']):
-            return
-        # drop his panel (message + its pin) and kill his chat side
-        panels = json.loads(tr.get('panels') or '{}')
-        if str(uid) in panels:
-            chat_id, msg_id = panels[str(uid)]
-            try:
-                await client.delete_messages(chat_id, msg_id)
-            except Exception:
-                pass
-            await _del_pin_note(client, chat_id, msg_id)
-            panels.pop(str(uid), None)
-            _exec('UPDATE trades SET panels=? WHERE id=?', (json.dumps(panels), tid))
-        col = 'chat_off_seller' if uid == tr['seller'] else 'chat_off_buyer'
-        _exec(f'UPDATE trades SET {col}=1, chat_open=0 WHERE id=?', (tid,))
-        await notify(client, uid, T(uid, 'room_closed'))
+        await _cb_close(client, event, uid, data)
         return
 
     if data == 'p2p:active':
@@ -2490,9 +3483,11 @@ async def on_callback(client, event, data):
         w['unit'] = unit
         if unit == 'sats':
             w['step'] = 'amount'
+            _wiz[uid] = w
             txt = T(uid, 'wiz_amount')
         else:
             w['step'] = 'fiat_amount'
+            _wiz[uid] = w
             _rate, _fiat = await bot_fiat_rate(uid)
             fw = fiat_word(uid, _fiat)
             txt = T(uid, 'wiz_fiat_amount').replace('تومان', fw).replace('Toman', fw)
@@ -2525,13 +3520,10 @@ async def on_callback(client, event, data):
         w = _wiz.get(uid) or {}
         w['method'] = ''
         w['step'] = 'ttl'
+        _wiz[uid] = w
         # expiry picker (same as the text path)
-        if lang_of(uid) == 'fa':
-            t_text = '⏳ سفارش تا کی تو بازار بمونه؟'
-            t_labels = [r[0] for r in ORDER_TTLS]
-        else:
-            t_text = '⏳ How long should the order stay on the market?'
-            t_labels = [r[1] for r in ORDER_TTLS]
+        t_text = T(uid, 'ttl_ask')
+        t_labels = [T(uid, 'ttl_12h'), T(uid, 'ttl_24h'), T(uid, 'ttl_2d')]
         await event.edit(t_text, buttons=[
             [_btn(t_labels[0], f'p2p:ttl:{ORDER_TTLS[0][2]}'),
              _btn(t_labels[1], f'p2p:ttl:{ORDER_TTLS[1][2]}')],
@@ -2721,6 +3713,10 @@ async def on_callback(client, event, data):
     if data.startswith('p2p:dspgo:'):
         await event.answer()
         tid = int(data.split(':')[2])
+        tr = get_trade(tid)
+        if not tr or uid not in (tr['buyer'], tr['seller']) or tr['stage'] not in (ST_LOCKED, ST_FIAT, ST_DISPUTED):
+            await notify(client, uid, T(uid, 'no_action'))
+            return
         _wiz[f'dsp:{uid}'] = tid  # capture optional note as next text
         # in-place: the confirm row becomes the note prompt — no leftover buttons
         await event.edit(T(uid, 'dispute_note'),
@@ -2728,109 +3724,230 @@ async def on_callback(client, event, data):
         return
 
     # ---- پنل ادمین ----
+    if data.startswith('p2p:admholds:'):
+        if await _admin_gate(event, uid):
+            return
+        await event.answer()
+        cursor = max(0, int(data.split(':')[2]))
+        rows = _rows(f"SELECT * FROM trades WHERE id>? AND {HOLDS_WHERE} ORDER BY id LIMIT 10", (cursor,))
+        total = (_one(f"SELECT COUNT(*) AS c FROM trades WHERE {HOLDS_WHERE}") or {}).get('c') or 0
+        buttons = [[_btn(f'#{r["id"]} · {r["stage"]}', f'p2p:admhold:{r["id"]}')] for r in rows]
+        if len(rows) == 10:
+            buttons.append([_btn(T(uid, 'next'), f'p2p:admholds:{rows[-1]["id"]}')])
+        buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
+        await event.edit(f'{T(uid, "holds_panel")} ({total})\n\n{T(uid, "holds_title")}', buttons=buttons)
+        return
+    if data.startswith('p2p:admhold:'):
+        if await _admin_gate(event, uid):
+            return
+        await event.answer()
+        tr = get_trade(int(data.split(':')[2]))
+        if not tr:
+            await event.edit(T(uid, 'trade_missing')); return
+        attempt = _one('SELECT * FROM escrow_fee_attempts WHERE trade_id=?', (tr['id'],))
+        unknown = T(uid, 'unknown')
+        text = T(uid, 'hold_detail', id=tr['id'], stage=tr['stage'], buyer=tr['buyer'], seller=tr['seller'], lock=tr['lock_pay_id'] or unknown, payout=tr['payout_id'] or unknown, refund=tr['refund_id'] or unknown, fee=tr['fee'], tries=tr['fee_tries'], fee_id=(attempt or {}).get('payment_id') or unknown)
+        # conflict evidence for invalidated / conflicted holds
+        conflicts = _hold_conflict_lines(tr, attempt)
+        if conflicts:
+            text += T(uid, 'hold_conflict_title', lines='\n'.join(conflicts))
+        buttons = []
+        settled = {r['kind'] for r in _rows('SELECT kind FROM escrow_adjudications WHERE trade_id=?', (tr['id'],))}
+        # settle buttons only where bound evidence can exist and none is recorded yet
+        if tr['payout_id'] and 'payout' not in settled and tr['stage'] in (ST_PAYOUT, ST_DONE):
+            buttons.append([_btn(T(uid, 'mark_settled_payout'), f'p2p:adjudicate:payout:{tr["id"]}')])
+        if tr['refund_id'] and 'refund' not in settled and tr['stage'] == ST_REFUND:
+            buttons.append([_btn(T(uid, 'mark_settled_refund'), f'p2p:adjudicate:refund:{tr["id"]}')])
+        if (attempt or {}).get('payment_id') and 'fee' not in settled and tr['stage'] == ST_DONE and not tr['fee_paid']:
+            buttons.append([_btn(T(uid, 'mark_settled_fee'), f'p2p:adjudicate:fee:{tr["id"]}')])
+        # one-attempt fee send: only with an adjudicated, conflict-free payout and no prior attempt
+        if tr['stage'] == ST_DONE and not tr['fee_paid'] and not tr['fee_tries'] and not attempt:
+            proof = _one("SELECT a.payment_id FROM escrow_adjudications a JOIN escrow_events e ON e.id=a.event_id "
+                         "WHERE a.trade_id=? AND a.kind='payout' AND e.conflict=0 AND e.direction='SEND' "
+                         "AND e.amount=a.amount AND e.status='COMPLETED' AND e.payment_id=a.payment_id "
+                         "AND EXISTS (SELECT 1 FROM escrow_observations o WHERE o.event_id=e.id "
+                         "AND o.direction='SEND' AND o.amount=e.amount AND o.status='COMPLETED')", (tr['id'],))
+            if proof and proof.get('payment_id') == tr['payout_id']:
+                buttons.append([_btn(T(uid, 'send_fee'), f'p2p:feeconfirm:{tr["id"]}')])
+        # legacy trades resolve through the dispute case (acknowledgement path)
+        if (tr['safety_version'] or 0) < 1 and tr['stage'] in (ST_LOCKED, ST_FIAT, ST_DISPUTED):
+            buttons.append([_btn(T(uid, 'hold_open_case'), f'p2p:admcase:{tr["id"]}')])
+        buttons.append([_btn(T(uid, 'holds_back'), 'p2p:admholds:0')])
+        await event.edit(text, buttons=buttons, parse_mode=None)
+        return
+    if data.startswith('p2p:adjudicate:'):
+        if await _admin_gate(event, uid):
+            return
+        _, _, kind, tid = data.split(':')
+        result = admin_adjudicate(uid, int(tid), kind)
+        if result == 'settled':
+            await deliver_trade_notices(client, int(tid))
+        await event.answer(T(uid, 'result_' + result.replace(' ', '_')), alert=True)
+        return
+    if data.startswith('p2p:feeconfirm:'):
+        if await _admin_gate(event, uid):
+            return
+        tid = int(data.split(':')[2])
+        tr = get_trade(tid)
+        if not tr or tr['stage'] != ST_DONE or tr['fee_paid'] or tr['fee_tries'] \
+                or _one('SELECT 1 FROM escrow_fee_attempts WHERE trade_id=?', (tid,)):
+            await event.answer(T(uid, 'result_held'), alert=True); return
+        nonce = issue_escrow_confirmation(uid, tid, 'fee')
+        await event.answer()
+        await event.edit(T(uid, 'confirm_fee_text', fee=tr['fee']), buttons=[[_btn(T(uid, 'confirm_fee'), f'p2p:feesend:{tid}:{nonce}')], [_btn(T(uid, 'cancel_admin'), f'p2p:admhold:{tid}')]])
+        return
+    if data.startswith('p2p:feesend:'):
+        if await _admin_gate(event, uid):
+            return
+        parts = data.split(':')
+        if len(parts) != 4 or not parts[2].isdigit() or not consume_escrow_confirmation(uid, int(parts[2]), 'fee', parts[3]):
+            await event.answer(T(uid, 'confirmation_invalid'), alert=True); return
+        await event.answer()
+        result = await admin_send_fee(client, uid, int(parts[2]))
+        await event.respond(T(uid, 'result_held') if result.startswith('held') else T(uid, 'result_' + result.replace(' ', '_')))
+        return
+    if data.startswith('p2p:admevents:'):
+        if await _admin_gate(event, uid):
+            return
+        await event.answer()
+        cursor = int(data.split(':')[2])
+        rows = _rows(f"SELECT * FROM escrow_events WHERE {EVENTS_WHERE} AND id>? ORDER BY id LIMIT 10", (max(0, cursor),))
+        total = (_one(f"SELECT COUNT(*) AS c FROM escrow_events WHERE {EVENTS_WHERE}") or {}).get('c') or 0
+        text = f'{T(uid, "events_panel")} ({total})\n\n{T(uid, "events_title")}'
+        buttons = [[_btn(f'#{r["id"]} · {r["direction"]} · {r["amount"]}', f'p2p:admevent:{r["id"]}')] for r in rows]
+        if len(rows) == 10:
+            buttons.append([_btn(T(uid, 'next'), f'p2p:admevents:{rows[-1]["id"]}')])
+        buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
+        await event.edit(text, buttons=buttons)
+        return
+    if data.startswith('p2p:admevent:'):
+        if await _admin_gate(event, uid):
+            return
+        await event.answer()
+        eid = int(data.split(':')[2])
+        row = _one('SELECT * FROM escrow_events WHERE id=?', (eid,))
+        if not row:
+            await event.edit(T(uid, 'event_missing')); return
+        observations = _rows('SELECT direction,amount,status FROM escrow_observations WHERE event_id=? ORDER BY observed_at', (eid,))
+        evidence = '\n'.join(f'{r["direction"]} {r["amount"]} · {r["status"]}' for r in observations)
+        text = T(uid, 'event_detail', id=eid, pid=row['payment_id'] or T(uid, 'unknown'), direction=row['direction'], amount=row['amount'], status=row['status'], conflict=row['conflict'], evidence=evidence, review=row['review_note'] or T(uid, 'not_reviewed'))
+        buttons = [[_btn(T(uid, 'record_evidence'), f'p2p:admreview:{eid}')], [_btn(T(uid, 'events_back'), 'p2p:admevents:0')]]
+        await event.edit(text, buttons=buttons, parse_mode=None)
+        return
+    if data.startswith('p2p:admreview:'):
+        if await _admin_gate(event, uid):
+            return
+        await event.answer()
+        eid = int(data.split(':')[2])
+        _wiz[f'adm:{uid}'] = {'m': 'event_review', 'id': eid, 'ts': time.time()}
+        await event.edit(T(uid, 'event_review_prompt'))
+        return
     if data.startswith('p2p:admcase:'):
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         await event.answer()
         await admin_case_view(client, uid, int(data.split(':')[2]), edit_event=event)
         return
     if data.startswith('p2p:admchat:'):
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         await event.answer()
         tid = int(data.split(':')[2])
-        await event.edit(chat_summary(tid, 60),
-                         buttons=[[_btn('« پرونده', f'p2p:admcase:{tid}')]])
+        await event.edit(chat_summary(tid, 60, uid=uid),
+                         buttons=[[_btn(T(uid, 'adm_case_back'), f'p2p:admcase:{tid}')]])
         return
     if data.startswith('p2p:adm:unban:'):
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         await event.answer()
         tuid = int(data.split(':')[3])
         unban_user(tuid)
         try:
-            await notify(client, tuid, '♻️ رفع بن شدی — به بخش P2P خوش برگشتی.')
+            await notify(client, tuid, T(tuid, 'adm_unban_notify'))
         except Exception:
             pass
         await admin_banlist(client, uid, edit_event=event)
         return
     if data.startswith('p2p:adm:admdel:'):
         if uid != admin_id():
-            await event.answer('⛔️ فقط مالک', alert=True); return
+            await event.answer(T(uid, 'adm_owner_only'), alert=True); return
         await event.answer()
         _exec('DELETE FROM p2p_admins WHERE uid=?', (int(data.split(':')[3]),))
         await admin_admins(client, uid, edit_event=event)
         return
     if data == 'p2p:adm':
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         await event.answer()
         await admin_panel(client, uid, edit_event=event)
         return
     if data == 'p2p:adm:disputes':
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         await event.answer()
         await admin_disputes(client, uid, edit_event=event)
         return
     if data == 'p2p:adm:ban':
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         await event.answer()
         _wiz[f'adm:{uid}'] = {'m': 'ban', 'ts': time.time()}
-        await event.edit('🚫 آیدی عددی کاربر رو بفرست (دلیل رو هم با فاصله بنویس):\n\nمثال: 123456789 کلاهبردار',
-                         buttons=[[_btn('« پنل', 'p2p:adm')]])
+        await event.edit(T(uid, 'adm_ban_prompt'),
+                         buttons=[[_btn(T(uid, 'admin_back'), 'p2p:adm')]])
         return
     if data == 'p2p:adm:banlist':
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         await event.answer()
         await admin_banlist(client, uid, edit_event=event)
         return
     if data == 'p2p:adm:admins':
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         await event.answer()
         await admin_admins(client, uid, edit_event=event)
         return
     if data == 'p2p:adm:admadd':
         if uid != admin_id():
-            await event.answer('⛔️ فقط مالک می‌تونه ادمین اضافه کنه', alert=True); return
+            await event.answer(T(uid, 'adm_owner_only_add'), alert=True); return
         await event.answer()
         _wiz[f'adm:{uid}'] = {'m': 'admadd', 'ts': time.time()}
-        await event.edit('➕ آیدی عددی ادمین جدید رو بفرست:',
-                         buttons=[[_btn('« پنل', 'p2p:adm')]])
+        await event.edit(T(uid, 'adm_add_prompt'),
+                         buttons=[[_btn(T(uid, 'admin_back'), 'p2p:adm')]])
         return
     if data.startswith('p2p:adm:banok:'):
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         st = _wiz.get(f'adm:{uid}')
         if (not isinstance(st, dict) or st.get('m') != 'ban2'
                 or time.time() - (st.get('ts') or 0) > 900):
-            await event.answer('⏳ منقضی شد — دوباره از پنل بن کن.', alert=True); return
+            await event.answer(T(uid, 'adm_ban_expired'), alert=True); return
         target = int(data.split(':')[3])
         if target != st.get('target'):
-            await event.answer('⛔️ ناسازگار — دوباره از پنل بن کن.', alert=True); return
+            await event.answer(T(uid, 'adm_ban_mismatch'), alert=True); return
         await event.answer()
         _wiz.pop(f'adm:{uid}', None)
         reason = st.get('reason', '')
         ban_user(target, reason)
         try:
-            await notify(client, target, '🚫 دسترسی‌ات به بخش P2P مسدود شد.')
+            await notify(client, target, T(target, 'adm_ban_notify'))
         except Exception:
             pass
         await audit(client, 0, 'P2P BAN', f'{target} — {reason or "—"} (by {uid})')
         await admin_banlist(client, uid, edit_event=event)
         return
     if data.startswith('p2p:adm:cxlive:'):
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True); return
+        if await _admin_gate(event, uid):
+            return
         await event.answer()
         tid = int(data.split(':')[3])
         tr = get_trade(tid)
         if tr and tr['stage'] == ST_LOCKING:
-            _exec("UPDATE trades SET stage=?, updated=? WHERE id=? AND stage=?",
-                  (ST_CANCELED, time.time(), tid, ST_LOCKING))
+            cur = _exec("UPDATE trades SET stage=?, updated=? WHERE id=? AND stage=? AND COALESCE(safety_version,0)>=1 AND COALESCE(lock_sent,0)=0",
+                        (ST_CANCELED, time.time(), tid, ST_LOCKING))
+            if cur.rowcount != 1:
+                await event.respond(T(uid, 'adm_cx_inflight'))
+                return
             _exec("UPDATE orders SET status='open', taken_at=NULL WHERE id=? AND status='taken'",
                   (tr['order_id'],))
             for party in (tr['buyer'], tr['seller']):
@@ -2838,34 +3955,64 @@ async def on_callback(client, event, data):
             await channel_status(tr['order_id'], '⛔️ لغو شد', delete=True)
             await update_room(client, tid)
             await audit(client, 0, 'P2P ADMIN CANCEL', f'trade #{tid} (by {uid})')
-            await event.respond(f'✅ معاوضه #{tid} لغو شد و سفارش برگشت بازار.')
+            await event.respond(T(uid, 'adm_cx_done', id=tid))
         else:
-            await event.respond('⚠️ فقط معاوضه‌ی قفل‌نشده از پنل لغو می‌شه؛ پول‌دارها از پرونده‌ی اختلاف.')
+            await event.respond(T(uid, 'adm_cx_only_locking'))
+        return
+    if data.startswith('p2p:legacyack:'):
+        if await _admin_gate(event, uid):
+            return
+        parts = data.split(':')
+        if len(parts) != 5 or parts[2] not in ('release', 'refund') or not parts[3].isdigit():
+            await event.answer(T(uid, 'confirmation_invalid'), alert=True); return
+        action, tid = parts[2], int(parts[3])
+        if not consume_escrow_confirmation(uid, tid, 'legacy_' + action, parts[4]):
+            await event.answer(T(uid, 'confirmation_invalid'), alert=True); return
+        tr = get_trade(tid)
+        if not tr or (tr['safety_version'] or 0) >= 1:
+            await event.answer(T(uid, 'legacy_none'), alert=True); return
+        _exec('INSERT INTO escrow_admin_actions(trade_id,kind,admin_uid,acted_at) VALUES (?,?,?,?)', (tid, 'legacy_ack_' + action, uid, time.time()))
+        await event.answer()
+        if action == 'release':
+            await admin_release(client, tid, legacy_ack=True, actor=uid)
+        else:
+            await admin_refund(client, tid, legacy_ack=True, actor=uid)
+        await event.respond(T(uid, 'legacy_recorded'))
         return
     if data.startswith('p2p:admrel:'):
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True)
+        if await _admin_gate(event, uid):
             return
         await event.answer()
         tid = int(data.split(':')[2])
+        tr = get_trade(tid)
+        if tr and (tr['safety_version'] or 0) < 1:
+            nonce = issue_escrow_confirmation(uid, tid, 'legacy_release')
+            await event.edit(T(uid, 'legacy_warning'), buttons=[[_btn(T(uid, 'legacy_release'), f'p2p:legacyack:release:{tid}:{nonce}')], [_btn(T(uid, 'cancel_admin'), f'p2p:admcase:{tid}')]])
+            return
         await admin_release(client, tid)
-        await notify(client, uid, f'✅ p2p #{tid} آزادسازی شد')
+        await notify(client, uid, T(uid, 'admin_check_status', id=tid))
         return
 
     if data.startswith('p2p:admref:'):
-        if not is_p2p_admin(uid):
-            await event.answer('⛔️ فقط ادمین', alert=True)
+        if await _admin_gate(event, uid):
             return
         await event.answer()
         tid = int(data.split(':')[2])
+        tr = get_trade(tid)
+        if tr and (tr['safety_version'] or 0) < 1:
+            nonce = issue_escrow_confirmation(uid, tid, 'legacy_refund')
+            await event.edit(T(uid, 'legacy_warning'), buttons=[[_btn(T(uid, 'legacy_refund'), f'p2p:legacyack:refund:{tid}:{nonce}')], [_btn(T(uid, 'cancel_admin'), f'p2p:admcase:{tid}')]])
+            return
         await admin_refund(client, tid)
-        await notify(client, uid, f'↩️ p2p #{tid} برگشت خورد')
+        await notify(client, uid, T(uid, 'admin_check_status', id=tid))
         return
 
     await event.answer()
 
 
 async def _edit_event_room(event, uid, tr, confirm):
+    if not tr or uid not in (tr['buyer'], tr['seller']):
+        return
     await event.edit(room_text(uid, tr), buttons=room_buttons(uid, tr, confirm=confirm))
 
 
@@ -2875,7 +4022,10 @@ async def on_text(client, event, text):
     """Returns True when the p2p section consumed this text."""
     uid = event.sender_id
     init_db()
-    if not enabled_for(uid):
+    if not is_p2p_admin(uid) and not enabled_for(uid):
+        return False
+
+    if not text and any(getattr(event, kind, None) for kind in ('media', 'photo', 'document', 'audio', 'video', 'voice')):
         return False
 
     # wizard capture
@@ -2883,7 +4033,7 @@ async def on_text(client, event, text):
     if w and isinstance(w, dict) and w.get('step') in ('amount', 'price', 'sats_price', 'method', 'ttl', 'fiat_amount', 'premium', 'unit', 'pmode'):
         # ttl is button-only; free text in that step falls through to chat/wallet
         result = await wiz_text(client, event, uid, text)
-        if result and isinstance(_wiz.get(uid), dict):
+        if result and _wiz.get(uid) is w:
             _wiz[uid] = w          # persist mutations back to the shelf
         return result
 
@@ -2891,8 +4041,9 @@ async def on_text(client, event, text):
     key = f'dsp:{uid}'
     if key in _wiz:
         tid = _wiz.pop(key)
-        await open_dispute(client, uid, tid, reason=text)
-        await event.respond(T(uid, 'dispute_open'))
+        opened = await open_dispute(client, uid, tid, reason=text)
+        if opened:
+            await event.respond(T(uid, 'dispute_open'))
         return True
 
     # admin panel input capture (ban uid / add admin)
@@ -2902,47 +4053,53 @@ async def on_text(client, event, text):
         mode = st.get('m') if isinstance(st, dict) else None
         if not is_p2p_admin(uid) or not mode or time.time() - (st.get('ts') or 0) > 900:
             return True
+        if mode == 'event_review':
+            if review_escrow_event(uid, st.get('id'), text):
+                await event.respond(T(uid, 'event_review_saved'))
+            else:
+                await event.respond(T(uid, 'event_review_failed'))
+            return True
         if mode == 'admadd' and uid != admin_id():
-            await event.respond('⛔️ فقط مالک می‌تونه ادمین اضافه کنه.')
+            await event.respond(T(uid, 'adm_owner_only_add'))
             return True
         parts = text.split(None, 1)
         try:
             target = int(parts[0].strip().lstrip('@'))
         except Exception:
-            await event.respond('⚠️ آیدی عددی معتبر نیست. مثال: 123456789')
+            await event.respond(T(uid, 'adm_invalid_uid'))
             _wiz[akey] = {'m': mode, 'ts': time.time()}
             return True
         reason = parts[1].strip() if len(parts) > 1 else ''
         if mode == 'ban':
             if target == uid:
-                await event.respond('😅 خودت رو نمی‌شه بن کرد.')
+                await event.respond(T(uid, 'adm_ban_self'))
                 return True
             _wiz[akey] = {'m': 'ban2', 'target': target, 'reason': reason, 'ts': time.time()}
-            lines = ['🚫 بن این کاربر رو تأیید می‌کنی؟', '', f'👤 {target}']
+            lines = [T(uid, 'adm_ban_confirm'), '', T(uid, 'adm_ban_user', target=target)]
             if reason:
-                lines.append(f'📝 {reason}')
-            kb = [[_btn('✅ بن کن', f'p2p:adm:banok:{target}'), _btn('❌ انصراف', 'p2p:adm')]]
+                lines.append(T(uid, 'adm_ban_reason', reason=reason))
+            kb = [[_btn(T(uid, 'adm_ban_yes'), f'p2p:adm:banok:{target}'), _btn(T(uid, 'adm_ban_no'), 'p2p:adm')]]
             lt = live_trade_of(target)
             if lt:
-                lines.append(f'\n⚠️ معاوضه‌ی فعال داره: #{lt["id"]} ({lt["stage"]})')
+                lines.append(T(uid, 'adm_ban_active', id=lt['id'], stage=lt['stage']))
                 if lt['stage'] == ST_LOCKING:
-                    lines.append('هنوز قفل نشده — می‌تونی لغوش کنی:')
-                    kb.insert(1, [_btn(f'🗑 لغو معاوضه #{lt["id"]}', f'p2p:adm:cxlive:{lt["id"]}')])
+                    lines.append(T(uid, 'adm_ban_locking_hint'))
+                    kb.insert(1, [_btn(T(uid, 'adm_cx_btn', id=lt['id']), f'p2p:adm:cxlive:{lt["id"]}')])
                 else:
-                    lines.append('پول تو بازیه — بعد از بن، از پرونده‌ی اختلاف حلش کن.')
+                    lines.append(T(uid, 'adm_ban_money_hint'))
             await event.respond('\n'.join(lines), buttons=kb)
             return True
         elif mode == 'admadd':
             if is_banned(target):
-                await event.respond('⛔️ این کاربر بنه — اول رفع بنش کن بعد ادمینش کن.')
+                await event.respond(T(uid, 'adm_banned_target'))
                 return True
             _exec('INSERT OR REPLACE INTO p2p_admins (uid, added_by, at) VALUES (?,?,?)',
                   (target, uid, time.time()))
             try:
-                await notify(client, target, '🛡 تو ادمین داوری P2P شدی — گزینه‌ی «🛡 ادمین» تو بخش P2P برات فعاله.')
+                await notify(client, target, T(target, 'adm_added_notify'))
             except Exception:
                 pass
-            await event.respond(f'✅ {target} ادمین داوری شد.')
+            await event.respond(T(uid, 'adm_added', target=target))
             await audit(client, 0, 'P2P ADMIN ADD', f'{target} (by {uid})')
         return True
 
@@ -2963,11 +4120,12 @@ async def on_text(client, event, text):
         except Exception:
             pass
         try:
-            await client.send_message(other, f'💬 #{tr["id"]}\n{text}')
-            await event.respond('✅ ارسال شد')
+            await client.send_message(other, T(uid, 'chat_relay_msg',
+                                               tid=tr['id'], text=text))
+            await event.respond(T(uid, 'msg_sent'))
         except Exception as e:
             logging.error(f'p2p chat relay {uid}: {e}')
-            await event.respond('⚠️ ارسال نشد — دوباره امتحان کن')
+            await event.respond(T(uid, 'msg_fail'))
         return True
     return False
 
@@ -2999,6 +4157,13 @@ async def on_photo(client, event):
         except Exception:
             pass
         return True
+
+
+async def on_media(client, event):
+    """Relay photos only; unsupported media remains with the wallet handler."""
+    if not getattr(event, 'photo', None):
+        return False
+    return await on_photo(client, event)
 
 
 # ==================== main-menu hook ====================
@@ -3042,14 +4207,9 @@ def main_menu_button(uid):
     Shows an in-progress badge that jumps straight back into the trade room."""
     if not enabled_for(uid):
         return None
-    try:
-        from zap_i18n import get_user_lang
-        lang = get_user_lang(uid)
-    except Exception:
-        lang = 'en'
     n = active_trade_count(uid)
     if n > 0:
-        badge = f'({n} در جریان)' if lang == 'fa' else f'({n} active)'
+        badge = T(uid, 'p2p_btn_active', n=n)
         return _btn(f'🤝 P2P {badge}', 'p2p')
     return _btn('🤝 P2P', 'p2p')
 
