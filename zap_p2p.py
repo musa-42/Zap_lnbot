@@ -456,6 +456,7 @@ TXT = {
   'trade_notice_payout': 'معامله #{id}: پرداخت با بررسی مدیر ثبت شد.',
   'trade_notice_refund': 'معامله #{id}: بازگشت وجه با بررسی مدیر ثبت شد.',
   'trade_notice_invalidated': 'معامله #{id}: مدارک متناقض است؛ نتیجه نامعتبر و نیازمند بررسی است. پرداخت قبلی قابل برگشت خودکار نیست.',
+  'trade_notice_settlement_held': 'معامله #{id}: سند تکمیل تسویه ناقص است؛ تسویه خودکار انجام نشد و نیازمند بررسی مدیر است.',
 
 
   'home_title': '🤝 معاوضه ساتوشی',
@@ -712,6 +713,7 @@ TXT = {
   'trade_notice_payout': 'Trade #{id}: payout settlement recorded by an administrator.',
   'trade_notice_refund': 'Trade #{id}: refund settlement recorded by an administrator.',
   'trade_notice_invalidated': 'Trade #{id}: conflicting evidence invalidated the outcome; investigation required. A prior payment cannot be automatically reversed.',
+  'trade_notice_settlement_held': 'Trade #{id}: settlement evidence incomplete; automatic completion held for admin review.',
   'home_title': '🤝 P2P Exchange',
   'home_body': 'Trade your sats directly with people.\nThe bot only holds the funds; both sides set the price.',
   'home_fee': '💸 Fee: 0.5% from the seller',
@@ -1309,9 +1311,69 @@ async def admin_send_fee(client, uid, tid):
 
 
 def _complete_escrow_trade(tid, payout):
-    # shortcut: SDK history lacks authoritative completeness/uniqueness proof;
-    # retain all in-flight trades until a proven settlement design exists.
-    return None
+    """Settle a trade whose bound escrow send provably landed.
+
+    Evidence-gated and fail-closed: the ONLY path to ST_DONE/ST_REFUNDED
+    without an admin adjudication is a journaled escrow_events row for the
+    trade's OWN bound payment id — direction SEND, status COMPLETED,
+    conflict-free, amount exactly the version-aware expected amount.  Every
+    check and the stage claim run inside ONE BEGIN IMMEDIATE transaction, so
+    a concurrent settle/invalidated transition cannot interleave; a later
+    contradictory observation still flips the settled trade to ST_INVALIDATED
+    via _invalidate_event_trades.  Any evidence miss rolls back, warns and
+    queues one durable admin notice — deferral is failure, never a guess."""
+    tr = get_trade(tid)
+    if not tr:
+        return None
+    expected_stage = ST_PAYOUT if payout else ST_REFUND
+    column = 'payout_id' if payout else 'refund_id'
+    pid = tr.get(column)
+    if not isinstance(pid, str) or not pid.strip():
+        return None   # nothing proven yet — no send id was ever bound
+    expected_amount = payout_amount_of(tr) if payout else refund_amount_of(tr)
+    with _db_lock:
+        db = _connect()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            current = db.execute('SELECT * FROM trades WHERE id=?', (tid,)).fetchone()
+            if not current or current['stage'] != expected_stage:
+                db.commit()   # someone else settled or invalidated it first
+                return None
+            ev = db.execute('SELECT direction, amount, status, conflict FROM escrow_events WHERE payment_id=?', (pid,)).fetchone()
+            reason = None
+            if ev is None:
+                reason = 'no journaled event'
+            elif ev['direction'] != 'SEND':
+                reason = f"direction {ev['direction']}"
+            elif ev['status'] != 'COMPLETED':
+                reason = f"status {ev['status']}"
+            elif ev['conflict']:
+                reason = 'conflicting evidence'
+            else:
+                try:
+                    ok_amount = int(ev['amount']) == expected_amount
+                except (TypeError, ValueError):
+                    ok_amount = False
+                if not ok_amount:
+                    reason = f"amount {ev['amount']} != {expected_amount}"
+            if reason:
+                db.rollback()
+                logging.warning(f'p2p settlement evidence insufficient #{tid} ({reason})')
+                _exec('INSERT OR IGNORE INTO escrow_trade_notices(trade_id,kind,target) VALUES (?,?,?)',
+                      (tid, 'settlement_held', 'admin'))
+                return None
+            cur = db.execute(f'UPDATE trades SET stage=?, updated=?, cancel_seller=0, cancel_buyer=0 '
+                             f'WHERE id=? AND stage=? AND {column}=?',
+                             (ST_DONE if payout else ST_REFUNDED, time.time(), tid, expected_stage, pid))
+            if cur.rowcount != 1:
+                db.rollback()
+                return None
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    logging.info(f'p2p trade #{tid} settled ({"payout" if payout else "refund"}) pid={pid}')
+    return get_trade(tid)
 
 
 def _bind_escrow_send(tid, pid, payout):
@@ -1364,6 +1426,24 @@ async def reconcile_escrow_send(pid):
             await finish_payout(tr['id'])
         elif tr['stage'] == ST_REFUND:
             await finish_refund(tr['id'])
+
+
+async def _reconcile_bound_sends():
+    """Boot/periodic recovery: re-run settlement for every trade holding a
+    bound send id in an in-flight settle stage.  Idempotent — once settled
+    the stage no longer matches and the call is a no-op; without full
+    evidence the settle transaction holds the trade and queues an admin
+    notice (deduplicated by the notices primary key)."""
+    rows = _rows("SELECT payout_id, refund_id FROM trades "
+                 "WHERE (stage=? AND COALESCE(payout_id,'')<>'') "
+                 "OR (stage=? AND COALESCE(refund_id,'')<>'')", (ST_PAYOUT, ST_REFUND))
+    for row in rows:
+        for pid in (row['payout_id'], row['refund_id']):
+            if isinstance(pid, str) and pid.strip():
+                try:
+                    await reconcile_escrow_send(pid)
+                except Exception:
+                    logging.exception('p2p bound-send reconcile failed for payment %s', pid)
 
 
 async def _deliver_escrow_alerts(event_id=None):
@@ -1588,6 +1668,7 @@ async def startup_scan():
         except Exception:
             pass
     # Retry alerts even after failure; observations never authorize settlement.
+    await _reconcile_bound_sends()
     await replay_escrow_journal()
 
 
@@ -1872,7 +1953,16 @@ async def audit(client, tid, event, extra=''):
                     f'🕒 {ts}{chr(10) + extra if extra else ""}')
         else:
             text = f'🤝 P2P · {event}\n🕒 {ts}{chr(10) + extra if extra else ""}'
-        await b.client.send_message(int(os.getenv('BACKUP_CHANNEL_ID', '0') or 0), text, parse_mode='html')
+        # The service env does not export BACKUP_CHANNEL_ID (the bot modules
+        # hardcode it); falling back to the running module's constant keeps
+        # audit aimed at the same channel the bot's own backup writes to.
+        channel = int(os.getenv('BACKUP_CHANNEL_ID', '0') or 0)
+        if not channel:
+            channel = int(getattr(b, 'BACKUP_CHANNEL_ID', 0) or 0)
+        if not channel:
+            logging.warning(f'p2p audit skipped #{tid}: no backup channel configured')
+            return
+        await b.client.send_message(channel, text, parse_mode='html')
     except Exception as e:
         logging.warning(f'p2p audit failed #{tid}: {e}')
 
@@ -3049,6 +3139,9 @@ async def sweep(client):
             await reconcile_escrow_send(row['payment_id'])
     except Exception as e:
         logging.debug(f'p2p sweep ledger check: {e}')
+    # 4b) bound payout/refund ids reconcile even when the ledger check above
+    # failed — settlement needs only the journaled evidence, not the wallet.
+    await _reconcile_bound_sends()
     # Automatic fee sends are disabled, including for pre-existing DONE trades.
 
 

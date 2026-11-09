@@ -1,5 +1,18 @@
 # Changelog — Zap Wallet Bot
 
+## v3.2.1 (2026-11-09)
+
+- Evidence-gated automatic escrow settlement: a payout/refund trade settles
+  only when its bound payment id has a journaled `escrow_events` row that is
+  COMPLETED, conflict-free and exactly the expected amount; the check and the
+  stage claim run in one atomic transaction, and any doubt keeps the trade
+  held with an admin notice (fail-closed, never a guess)
+- Boot/sweep recovery: trades stuck in a settle stage with a bound payout or
+  refund id are re-reconciled automatically on startup and on sweep
+- P2P audit posts fall back to the running bot's backup channel constant when
+  `BACKUP_CHANNEL_ID` env is unset (previously failed with 'invalid Peer');
+  logs-only when no channel is configured at all
+
 ## v3.2 (2026-11-09)
 
 Production sync: zap_wallet_bot_v32.py replaces zap_wallet_bot_v31.py
