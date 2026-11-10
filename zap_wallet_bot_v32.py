@@ -370,6 +370,18 @@ PAYMENT_COMPLETION_TIMEOUT_SECS = 10
 # window before the calm still-processing terminal message.
 PAYMENT_RECHECK_INTERVAL_SECS = 10
 PAYMENT_RECHECK_TOTAL_SECS = 120
+# Bounded gate release (2026-11 incident: an already-paid invoice raised a
+# conclusive AlreadyExists duplicate which was classified as a send_started
+# UNKNOWN; the timer-only recheck aged out and left payment_processing set
+# FOREVER — the user could never pay again). When a timer-only (payment_id
+# = None) recheck ages out still-unknown, ONE delayed gate release is
+# scheduled: it reopens the gate only if the SAME prepare_response is still
+# stashed (a newer flow built meanwhile must survive). The already-submitted
+# invoice is never auto-retried — a later manual retry hits the network's
+# duplicate rejection and _duplicate_payment_error classifies it, so it
+# cannot double-pay silently. payment_id!=None rechecks resolve via
+# evidence and never use this.
+PAYMENT_GATE_RELEASE_SECS = 1800
 # Hang guard (2026-11 incident: one wedged SDK call froze every wallet touch
 # bot-wide — it held connections_lock/user_lock forever). Read-only SDK calls
 # are cancelled after this budget so callers surface a clean error and locks
@@ -654,9 +666,7 @@ async def process_password_resets():
             try:
                 await client.send_message(
                     user_id,
-                    "🔓 **Password Reset Complete**\n\n"
-                    "Your send password has been removed as requested.\n\n"
-                    "You can set a new password in Settings.",
+                    t(user_id, "pw_reset_done_notify"),
                     buttons=[[Button.inline(t(user_id, "btn_settings"), b"settings")]]
                 )
             except Exception as e:
@@ -1476,6 +1486,7 @@ def sats_to_fiat(sats, fiat_rate):
 async def format_balance_with_fiat(balance_sats, user_id):
     """Format balance with user's preferred fiat equivalent"""
     balance_int = int(balance_sats)
+    unit = t(user_id, "sats_unit")
     fiat_code = get_user_fiat(user_id)
     fiat_rate = await get_fiat_rate(fiat_code)
     if fiat_rate:
@@ -1484,30 +1495,32 @@ async def format_balance_with_fiat(balance_sats, user_id):
             symbol = "$" if fiat_code == "USD" else ""
             # For large values (low-value currencies like IRT), show without decimals
             if fiat_value >= 1000:
-                return f"{balance_int:,} sats (~{symbol}{fiat_value:,.0f} {fiat_code})"
+                return f"{balance_int:,} {unit} (~{symbol}{fiat_value:,.0f} {fiat_code})"
             else:
-                return f"{balance_int:,} sats (~{symbol}{fiat_value:,.2f} {fiat_code})"
-    return f"{balance_int:,} sats"
+                return f"{balance_int:,} {unit} (~{symbol}{fiat_value:,.2f} {fiat_code})"
+    return f"{balance_int:,} {unit}"
 
 
-async def format_balance_with_usd(balance_sats):
-    """Format balance with USD equivalent"""
+async def format_balance_with_usd(balance_sats, user_id=None):
+    """Format balance with USD equivalent (unit word follows the user's lang)"""
+    unit = t(user_id, "sats_unit")
     usd_rate = await get_usd_rate()
     if usd_rate:
         usd_value = sats_to_usd(int(balance_sats), usd_rate)
         if usd_value is not None:
-            return f"{balance_sats} sats (~${usd_value} USD)"
-    return f"{balance_sats} sats"
+            return f"{balance_sats} {unit} (~${usd_value} USD)"
+    return f"{balance_sats} {unit}"
 
 
-async def format_amount_with_usd(amount_sats):
-    """Format amount with USD equivalent"""
+async def format_amount_with_usd(amount_sats, user_id=None):
+    """Format amount with USD equivalent (unit word follows the user's lang)"""
+    unit = t(user_id, "sats_unit")
     usd_rate = await get_usd_rate()
     if usd_rate:
         usd_value = sats_to_usd(int(amount_sats), usd_rate)
         if usd_value is not None:
-            return f"{amount_sats} sats (~${usd_value})"
-    return f"{amount_sats} sats"
+            return f"{amount_sats} {unit} (~${usd_value})"
+    return f"{amount_sats} {unit}"
 
 
 # ==================== HELPER: Format Payment Details ====================
@@ -1525,15 +1538,15 @@ def format_timestamp(timestamp):
     return 'Unknown'
 
 
-def get_status_icon_and_text(status):
-    """Get status emoji and text from payment status"""
+def get_status_icon_and_text(status, user_id=None):
+    """Get status emoji and localized text from payment status"""
     status_str = str(status).lower()
     if 'complete' in status_str or 'succeeded' in status_str:
-        return "✅", "Success"
+        return "✅", t(user_id, "st_success")
     elif 'pending' in status_str:
-        return "⏳", "Pending"
+        return "⏳", t(user_id, "st_pending")
     elif 'failed' in status_str:
-        return "❌", "Failed"
+        return "❌", t(user_id, "st_failed")
     else:
         return "⚪", str(status)
 
@@ -1569,8 +1582,7 @@ async def show_tip_prompt(user_id, chat_id=None):
         amount_row = [Button.inline(f"{a:,} ⚡", f"tip_amount_{a}".encode()) for a in TIP_AMOUNTS]
         await client.send_message(
             target,
-            "❤️ **Enjoying Zap?**\n\n"
-            "A small tip helps keep the bot running. Fully optional — thanks for being here!",
+            t(user_id, "tip_prompt_text"),
             buttons=[
                 amount_row,
                 [Button.inline(t(user_id, "btn_custom_amount"), b"tip_custom")],
@@ -1716,7 +1728,7 @@ async def _batch_send_all(event, user_id):
     batch_id = ud.get('batch_id')
     entries = ud.get('batch_items') or []
     if not batch_id or not entries:
-        await event.edit("❌ Batch is empty.", buttons=None)
+        await event.edit(t(user_id, "batch_empty"), buttons=None)
         return
     # send-password gate — identical check and hash binding to normal payments
     if has_send_password(user_id):
@@ -1727,8 +1739,8 @@ async def _batch_send_all(event, user_id):
             await event.answer()
             await event.respond(t(user_id, 'batch_password_required'))
             return
-    await event.answer("🚀 Sending batch...")
-    progress = await event.edit(f"⏳ Sending 0/{len(entries)}...")
+    await event.answer(t(user_id, "batch_sending"))
+    progress = await event.edit(t(user_id, "batch_sending_progress", i=0, n=len(entries)))
     ok = fail = held = 0
     total = 0
     by_id = {e.get('row_id'): e for e in entries}
@@ -1777,13 +1789,12 @@ async def _batch_send_all(event, user_id):
             logging.error('Batch item %s requires manual reconciliation: user=%s batch=%s claim=%s',
                           item_id, user_id, batch_id, token)
         try:
-            await progress.edit(f"⏳ Sent {i}/{len(rows)} (ok {ok}, fail {fail}, held {held})")
+            await progress.edit(t(user_id, "batch_progress", i=i, n=len(rows),
+                                   ok=ok, fail=fail, held=held))
         except Exception:
             pass
     user_steps.pop(user_id, None)
-    done = ("✅ **Batch complete!**\n"
-            f"✅ Success: {ok}  ❌ Failed: {fail}  ⏳ Held: {held}\n"
-            f"💰 Total sent: {total:,} sats")
+    done = t(user_id, "batch_done", ok=ok, fail=fail, held=held, total=f"{total:,}")
     if held:
         done += '\n\n' + t(user_id, 'batch_hold')
     await progress.edit(done, buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
@@ -1807,6 +1818,29 @@ def is_payment_successful(payment):
     return False, 'unknown'
 
 
+def _duplicate_payment_error(err):
+    """Conclusive duplicate-submission rejection (2026-11 incident).
+
+    The SDK raises this when the user confirms an ALREADY-PAID invoice: the
+    network rejects the new request outright, so NOTHING new was sent and the
+    outcome is NOT unknown — the caller must release the duplicate-send gate
+    instead of wedging it behind a timer-only recheck. Matches ONLY this
+    explicit signature (case-insensitive, robust to the SDK's nested gRPC
+    quoting — the details bytes containing DUPLICATE_OPERATION appear inside
+    str(err) as logged); any other error, including a plain TimeoutError,
+    stays an unknown outcome and keeps the old recheck path.
+    """
+    try:
+        s = str(err)
+    except Exception:
+        return False
+    s = s.lower()
+    if 'duplicate_operation' in s:
+        return True
+    return ('alreadyexists' in s
+            and ('preimage request already exists' in s or 'paymenthash' in s))
+
+
 # ==================== PAYMENT RECHECK (read-only outcome poller) ====================
 # Owner order (2026-11): a PENDING/unknown SDK send result must never be shown
 # to the user as 'payment_hold'. The message is edited to a neutral
@@ -1816,12 +1850,10 @@ def is_payment_successful(payment):
 _PAYMENT_RECHECK_TASKS = set()
 
 
-def _payment_success_text(amount_display, fee_display, payment_id):
+def _payment_success_text(amount_display, fee_display, payment_id, user_id=None):
     """Success text shared by the live send path and the recheck task."""
-    return (f"✅ **Payment Successful!**\n\n"
-            f"💰 Amount: {amount_display}\n"
-            f"⚡ Fee: {fee_display}\n"
-            f"🆔 ID: `{payment_id}`")
+    return t(user_id, "pay_success",
+             amount=amount_display, fee=fee_display, payment_id=payment_id)
 
 
 def _payment_success_buttons(user_id, payment_id):
@@ -1831,30 +1863,22 @@ def _payment_success_buttons(user_id, payment_id):
     ]
 
 
-def _lnurl_success_text(amount_display, fee_display):
-    return (f"✅ **Payment Successful!**\n\n"
-            f"💰 Amount: {amount_display}\n"
-            f"⚡ Fee: {fee_display}\n"
-            f"Type: LNURL-Pay")
+def _lnurl_success_text(amount_display, fee_display, user_id=None):
+    return t(user_id, "pay_success_lnurl",
+             amount=amount_display, fee=fee_display)
 
 
-def _ffio_success_text(order_id, to_ccy):
-    return (f"✅ **Lightning payment sent to ff.io!**\n\n"
-            f"🆔 Order: `{order_id}`\n"
-            f"📥 You will receive **{to_ccy}** at your address.\n\n"
-            f"⏳ Exchange is processing. You'll be notified when done.")
+def _ffio_success_text(order_id, to_ccy, user_id=None):
+    return t(user_id, "ff_pay_success", order_id=order_id, to_ccy=to_ccy)
 
 
 def _ffio_success_buttons(user_id, order_id):
     return [[Button.inline(t(user_id, "btn_check_status"), f"ffio_st_{order_id}".encode())]]
 
 
-def _donation_success_text(amount_display, fee_display):
-    return (f"**Donation Successful!**\n\n"
-            f"Amount: {amount_display}\n"
-            f"Fee: {fee_display}\n\n"
-            f"Thank you for your support!\n"
-            f"Your donation helps keep this bot running!")
+def _donation_success_text(amount_display, fee_display, user_id=None):
+    return t(user_id, "donate_success",
+             amount=amount_display, fee=fee_display)
 
 
 async def _safe_edit_message(chat_id, message_id, text, buttons=None):
@@ -1899,6 +1923,34 @@ async def _payment_recheck_gate_cleanup(user_id, prepare_response, manage_gate,
         logging.warning(f'payment recheck gate cleanup failed for user {user_id}: {e}')
 
 
+async def _payment_gate_release_after(user_id, prepare_response):
+    """Bounded auto-release of the duplicate-send gate after a timer-only
+    (payment_id=None) recheck aged out still-unknown.
+
+    Without this the gate stayed set forever with no user escape. The gate is
+    cleared ONLY if it is still set AND the stashed prepare_response is still
+    the SAME object — a newer flow built meanwhile must survive untouched.
+    This NEVER sends or retries anything; a later manual retry of the same
+    invoice will be rejected by the network and caught by
+    _duplicate_payment_error instead of double-paying silently.
+    """
+    try:
+        await asyncio.sleep(PAYMENT_GATE_RELEASE_SECS)
+        async with user_lock(user_id):
+            ud = user_data.get(user_id)
+            if (isinstance(ud, dict) and ud.get('payment_processing')
+                    and ud.get('prepare_response') is prepare_response):
+                ud['payment_processing'] = False
+                ud.pop('prepare_response', None)
+                user_steps.pop(user_id, None)
+                logging.warning(
+                    'payment gate auto-released after unknown-outcome window uid=%s '
+                    '(invoice already submitted once; user accepts responsibility on retry)',
+                    user_id)
+    except Exception as e:
+        logging.warning(f'payment gate auto-release failed for user {user_id}: {e}')
+
+
 async def _payment_recheck_task(user_id, chat_id, message_id, payment_id,
                                 success_text, success_buttons=None, amount=None,
                                 fee=0, prepare_response=None, manage_gate=False,
@@ -1909,11 +1961,14 @@ async def _payment_recheck_task(user_id, chat_id, message_id, payment_id,
     COMPLETED → the same success text/buttons the live path shows;
     FAILED → 'payment_failed'; still unknown after the window → ONE calm
     'payment_still_processing' edit (payment ID shown) and the duplicate-send
-    gate stays set. This task NEVER sends, retries or refunds. A payment_id
-    of None/'N/A' (raised send, no payment object) runs timer-only: scanning
-    history to guess which payment is ours is not reliable enough to claim
-    success — same reasoning as zap_tokens.find_withdrawal_payment — so it
-    can only age out to the still-processing message.
+    gate stays set through the window. This task NEVER sends, retries or
+    refunds. A payment_id of None/'N/A' (raised send, no payment object) runs
+    timer-only: scanning history to guess which payment is ours is not
+    reliable enough to claim success — same reasoning as
+    zap_tokens.find_withdrawal_payment — so it can only age out to the
+    still-processing message; such a timer-only aging-out additionally
+    schedules ONE bounded gate release (see _payment_gate_release_after) so
+    the user is not gated out of paying forever.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + PAYMENT_RECHECK_TOTAL_SECS
@@ -1948,6 +2003,15 @@ async def _payment_recheck_task(user_id, chat_id, message_id, payment_id,
     await _safe_edit_message(chat_id, message_id,
                              t(user_id, 'payment_still_processing', payment_id=payment_id or 'N/A'),
                              buttons=None)
+    if manage_gate and prepare_response is not None and not can_poll:
+        # Timer-only unknown (no payment object ever came back): keep the gate
+        # through the observation window, then ONE bounded release so the user
+        # is not locked out of paying forever. payment_id!=None rechecks
+        # resolve via evidence and never schedule this.
+        task = asyncio.create_task(
+            _payment_gate_release_after(user_id, prepare_response))
+        _PAYMENT_RECHECK_TASKS.add(task)
+        task.add_done_callback(_PAYMENT_RECHECK_TASKS.discard)
 
 
 def _spawn_payment_recheck(**kwargs):
@@ -1959,23 +2023,23 @@ def _spawn_payment_recheck(**kwargs):
     return task
 
 
-def get_direction_info(payment):
-    """Get direction icon and text from payment type"""
+def get_direction_info(payment, user_id=None):
+    """Get direction icon and localized text from payment type"""
     payment_type = getattr(payment, 'payment_type', 'Unknown')
 
     if hasattr(payment, 'direction'):
         direction = payment.direction
         if direction == PaymentDirection.INCOMING:
-            return "📥", "Received", True
+            return "📥", t(user_id, "dir_received"), True
         else:
-            return "📤", "Sent", False
+            return "📤", t(user_id, "dir_sent"), False
     else:
         # Fallback: check payment_type
         type_str = str(payment_type).upper()
         if 'RECEIVE' in type_str:
-            return "📥", "Received", True
+            return "📥", t(user_id, "dir_received"), True
         else:
-            return "📤", "Sent", False
+            return "📤", t(user_id, "dir_sent"), False
 
 
 def extract_description_from_payment(payment):
@@ -2045,11 +2109,11 @@ def extract_description_from_payment(payment):
     return ""
 
 
-def build_queue_text(queue):
+def build_queue_text(queue, user_id=None):
     """Live queue summary: every pending payment + totals."""
     total = 0
     fee_total = 0
-    lines = ["\U0001f4e2 **Payment Queue**\n"]
+    lines = [t(user_id, "queue_title")]
     for i, it in enumerate(queue, 1):
         amt = it.get('amount')
         fee = int(it.get('fee') or 0)
@@ -2066,20 +2130,20 @@ def build_queue_text(queue):
         fee_total += fee
         dd = dest if len(dest) <= 30 else dest[:29] + "\u2026"
         amt_s = f"{amt:,}" if isinstance(amt, int) else str(amt)
-        lines.append(f"{i}. `{dd}` \u2014 {amt_s} sats")
-    lines.append(f"\n\u26fd Fees so far: {fee_total:,} sats")
-    lines.append(f"\U0001f4b0 **Queue total: {total:,} sats**")
+        lines.append(t(user_id, "queue_item", i=i, dest=dd, amount=amt_s))
+    lines.append(t(user_id, "queue_fees", total=fee_total))
+    lines.append(t(user_id, "queue_total", total=total))
     return "\n".join(lines), total, fee_total
 
 
-def payment_share_button(payment_id):
+def payment_share_button(payment_id, user_id=None):
     """Share row: view the transaction on sparkscan.io explorer."""
     if not payment_id or payment_id == 'N/A':
         return []
-    return [Button.url("🔍 View on Explorer", f"https://sparkscan.io/tx/{payment_id}")]
+    return [Button.url(t(user_id, "btn_view_explorer"), f"https://sparkscan.io/tx/{payment_id}")]
 
 
-async def format_payment_details(payment, payment_id=None):
+async def format_payment_details(payment, payment_id=None, user_id=None):
     """Format payment details into a readable string - reusable helper function
 
     Args:
@@ -2102,20 +2166,20 @@ async def format_payment_details(payment, payment_id=None):
         payment_id = getattr(payment, 'id', 'N/A')
 
     # Get direction info
-    direction_icon, direction_str, is_incoming = get_direction_info(payment)
+    direction_icon, direction_str, is_incoming = get_direction_info(payment, user_id)
 
     # Format timestamp
     time_str = format_timestamp(timestamp)
 
     # Status emoji
-    status_icon, status_text = get_status_icon_and_text(status)
+    status_icon, status_text = get_status_icon_and_text(status, user_id)
 
     # Format method
     method_str = str(method).replace('PaymentMethod.', '') if method else 'N/A'
 
     # Format amount with USD
-    amount_str = await format_amount_with_usd(amount_sats)
-    fee_str = await format_amount_with_usd(fees) if fees else "0 sats"
+    amount_str = await format_amount_with_usd(amount_sats, user_id)
+    fee_str = await format_amount_with_usd(fees, user_id) if fees else f"0 {t(user_id, 'sats_unit')}"
 
     # Extract description/memo from payment details
     description = extract_description_from_payment(payment)
@@ -2124,7 +2188,7 @@ async def format_payment_details(payment, payment_id=None):
     tx_id_line = ""
     if details:
         if hasattr(details, 'tx_id') and details.tx_id:
-            tx_id_line = f"🔗 **TX ID:**\n`{details.tx_id}`\n\n"
+            tx_id_line = f"🔗 {t(user_id, 'rep_lbl_txid')}\n`{details.tx_id}`\n\n"
 
     # ---- Extract all proof/hash fields from details (per type) ----
     def _shorten(s, n=20):
@@ -2183,42 +2247,42 @@ async def format_payment_details(payment, payment_id=None):
     has_separate_hash = bool(real_hash) and real_hash != str(payment_id)
 
     msg = (
-        f"🧾 ** TRANSACTION REPORT ** 🧾\n\n"
+        f"{t(user_id, 'rep_title')}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"**📋 GENERAL**\n"
+        f"{t(user_id, 'rep_sec_general')}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{direction_icon} **Type:** {direction_str}\n"
-        f"💰 **Amount:** {amount_str}\n"
-        f"⚡ **Fee:** {fee_str}\n"
-        f"{status_icon} **Status:** {status_text}\n"
-        f"🕐 **Time:** {time_str}\n"
-        f"🏷️ **Payment Type:** {str(payment_type).replace('PaymentType.', '')}\n"
-        f"📡 **Method:** {method_str}\n"
+        f"{direction_icon} {t(user_id, 'rep_lbl_type')} {direction_str}\n"
+        f"💰 {t(user_id, 'rep_lbl_amount')} {amount_str}\n"
+        f"⚡ {t(user_id, 'rep_lbl_fee')} {fee_str}\n"
+        f"{status_icon} {t(user_id, 'rep_lbl_status')} {status_text}\n"
+        f"🕐 {t(user_id, 'rep_lbl_time')} {time_str}\n"
+        f"🏷️ {t(user_id, 'rep_lbl_ptype')} {str(payment_type).replace('PaymentType.', '')}\n"
+        f"📡 {t(user_id, 'rep_lbl_method')} {method_str}\n"
     )
 
     if description:
-        msg += f"💬 **Description:** {_md_escape(str(description))}\n"
+        msg += f"💬 {t(user_id, 'rep_lbl_desc')} {_md_escape(str(description))}\n"
 
     # ---- PROOF section ----
     msg += (
         f"\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"**🔐 PROOF & HASHES**\n"
+        f"{t(user_id, 'rep_sec_proof')}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
     )
     if tx_id_line:
-        msg += f"🔗 **TX ID:**\n`{details.tx_id}`\n\n"
+        msg += f"🔗 {t(user_id, 'rep_lbl_txid')}\n`{details.tx_id}`\n\n"
     if has_separate_hash:
-        msg += f"#️⃣ **Payment Hash:**\n`{real_hash}`\n\n"
+        msg += f"#️⃣ {t(user_id, 'rep_lbl_hash')}\n`{real_hash}`\n\n"
     if preimage:
-        msg += f"🔑 **Preimage:**\n`{preimage}`\n\n"
+        msg += f"🔑 {t(user_id, 'rep_lbl_preimage')}\n`{preimage}`\n\n"
     if not any([tx_id_line, has_separate_hash, preimage]):
-        msg += "_No proof data available for this transaction._\n"
+        msg += t(user_id, 'rep_no_proof')
 
     # ---- DESTINATION / INVOICE section ----
     if invoice_str or dest_lines:
         msg += (
             f"\n━━━━━━━━━━━━━━━━━━━━\n"
-            f"**📍 ROUTE**\n"
+            f"{t(user_id, 'rep_sec_route')}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
         )
         for dl in dest_lines:
@@ -2226,11 +2290,11 @@ async def format_payment_details(payment, payment_id=None):
         if invoice_str:
             # full invoice in ONE code block — copy button copies it whole
             inv_full = str(invoice_str)
-            msg += f"⚡ **Invoice:**\n```{inv_full}```\n"
+            msg += f"⚡ {t(user_id, 'rep_lbl_invoice')}\n```{inv_full}```\n"
 
     msg += (
         f"\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔖 **ID:**\n`{payment_id}`"
+        f"🔖 {t(user_id, 'rep_lbl_id')}\n`{payment_id}`"
     )
 
     return msg
@@ -2281,10 +2345,7 @@ class UserEventListener(EventListener):
         try:
             await client.send_message(
                 self.user_id,
-                "⚠️ **Deposit detected**\n\n"
-                "An on-chain deposit couldn't be claimed automatically "
-                "(network fee above the limit).\n"
-                "Open **Deposits** in the menu to claim it manually.")
+                t(self.user_id, "dep_detected_notify"))
         except Exception as e:
             logging.error(f"[{self.user_id}] unclaimed-deposit notify failed: {e}")
 
@@ -2303,7 +2364,7 @@ class UserEventListener(EventListener):
             time_str = format_timestamp(timestamp)
 
             # Format amount with USD
-            amount_str = await format_amount_with_usd(amount)
+            amount_str = await format_amount_with_usd(amount, user_id)
 
             # Extract description/memo from payment details using helper
             description = extract_description_from_payment(payment)
@@ -2318,7 +2379,7 @@ class UserEventListener(EventListener):
                     time_diff = (datetime.now() - info['timestamp']).total_seconds()
                     logging.debug(f"[{self.user_id}] Found sender info, time_diff={time_diff}s, sender={info['sender_info']}")
                     if time_diff < 60:
-                        sender_line = f"👤 From: {info['sender_info']}\n"
+                        sender_line = t(self.user_id, "from_line", sender=info['sender_info'])
                         del pending_sender_info[self.user_id]
                         logging.info(f"[{self.user_id}] Added sender to notification: {info['sender_info']}")
 
@@ -2327,13 +2388,12 @@ class UserEventListener(EventListener):
 
             await client.send_message(
                 self.user_id,
-                f"⚡ **Payment Received!**\n\n"
-                f"{sender_line}"
-                f"💰 Amount: {amount_str}\n"
-                f"{fee_note}"
-                f"🕐 Time: {time_str}\n"
-                f"{f'💬 **Description:** {_md_escape(str(description))}' if description else ''}"
-                f"\n🔖 **ID:** `{payment_id}`"
+                t(self.user_id, "payment_received",
+                  sender=sender_line, amount=amount_str, fee_note=fee_note,
+                  time=time_str,
+                  desc=(t(self.user_id, "desc_line", desc=_md_escape(str(description)))
+                        if description else ''),
+                  pid=payment_id)
             )
             logging.info(f"[{self.user_id}] Notified: {amount} sats received")
 
@@ -2890,17 +2950,11 @@ def _looks_like_payment_input(text):
     return any(rx.match(t) for rx in _PAYMENT_INPUT_REGEXES)
 
 
-def _format_fees(fees):
+def _format_fees(fees, user_id):
     """Human-readable recommended on-chain fees (clearly labeled)."""
-    return (
-        "⛽ **Recommended Network Fees**\n"
-        "_(sat/vByte = satoshis per virtual byte; higher fee = faster confirmation)_\n\n"
-        f"⚡ **Next block** (fastest): `{fees.fastest_fee}`  — ~10 min\n"
-        f"🕒 **Half hour**: `{fees.half_hour_fee}`  — ~30 min\n"
-        f"🕐 **Hour**: `{fees.hour_fee}`  — ~60 min\n"
-        f"🐢 **Economy**: `{fees.economy_fee}`  — slower, cheaper\n"
-        f"🔻 **Minimum**: `{fees.minimum_fee}`  — lowest a miner will accept"
-    )
+    return t(user_id, "fees_card", fastest=fees.fastest_fee,
+             half=fees.half_hour_fee, hour=fees.hour_fee,
+             economy=fees.economy_fee, minimum=fees.minimum_fee)
 
 
 async def parse_input(sdk , input_str):
@@ -3253,9 +3307,11 @@ async def show_main_menu(event, edit=False, loading_msg=None):
         # For low-value currencies (like IRT), show fiat per sat instead
         if sats_per_unit < 1:
             fiat_per_sat = fiat_rate / SATS_PER_BTC  # Fiat per 1 sat
-            rate_info = f"\n{fiat_emoji} **1 sat ≈** {fiat_per_sat:,.0f} {fiat_code}"
+            rate_info = t(user_id, "rate_line_sat",
+                          emoji=fiat_emoji, value=fiat_per_sat, code=fiat_code)
         else:
-            rate_info = f"\n{fiat_emoji} **1 {fiat_code} ≈** {int(sats_per_unit):,} sats"
+            rate_info = t(user_id, "rate_line_unit",
+                          emoji=fiat_emoji, value=int(sats_per_unit), code=fiat_code)
 
     message = f"""{t(user_id, 'app_title')}
 
@@ -3325,7 +3381,7 @@ async def show_transaction_history(event, user_id, page=0):
             details = getattr(payment, 'details', None)
 
             # Determine if incoming or outgoing
-            direction_icon, direction_str, is_incoming = get_direction_info(payment)
+            direction_icon, direction_str, is_incoming = get_direction_info(payment, user_id)
 
             # Format timestamp
             time_str = format_timestamp(timestamp)
@@ -3377,7 +3433,7 @@ async def show_transaction_history(event, user_id, page=0):
                     usd_str = f" (~${usd_value})"
 
             # Status emoji
-            status_icon, status_text = get_status_icon_and_text(status)
+            status_icon, status_text = get_status_icon_and_text(status, user_id)
 
             # Extract description/memo from payment details
             description = ""
@@ -3394,7 +3450,7 @@ async def show_transaction_history(event, user_id, page=0):
             # Telegram start cap); token rows use the full TXID as the tracker.
 
             # sats suffix only for non-token payments
-            unit_str = "" if (is_token_payment and token_amount_str) else " sats"
+            unit_str = "" if (is_token_payment and token_amount_str) else f" {t(user_id, 'sats_unit')}"
             row = [f"{direction_icon} **{direction_str}** {status_icon}{tx_indicator}",
                    f"   💰 {amount_str}{unit_str}{usd_str}{description}"]
             if chain_str:
@@ -3410,7 +3466,7 @@ async def show_transaction_history(event, user_id, page=0):
                 payment_id = getattr(payment, 'id', None)
                 link_id = payment_id.split(':', 1)[0][:40] if payment_id else None
                 if link_id and bot_username:
-                    row.append(f"   🔍 [Details](https://t.me/{bot_username}?start=dt_{link_id})")
+                    row.append(f"   🔍 [{t(user_id, 'hist_details')}](https://t.me/{bot_username}?start=dt_{link_id})")
                 elif link_id:
                     row.append(f"   🔍 /dt_{link_id}")
             history_text += "\n".join(row) + "\n\n"
@@ -3447,7 +3503,7 @@ async def show_transaction_history(event, user_id, page=0):
 async def prepare_and_show_fee(event, user_id, invoice, amount):
     """Prepare payment and show fee confirmation with USD values"""
     try:
-        res = await event.respond("⚡ Calculating fees...")
+        res = await event.respond(t(user_id, "calc_loading"))
 
         prepare_response, fee_sats, spark_fee = await prepare_payment(user_id, invoice, amount)
 
@@ -3464,9 +3520,9 @@ async def prepare_and_show_fee(event, user_id, invoice, amount):
         total = amount + final_fee if amount else final_fee
 
         # Get USD values
-        amount_usd = await format_amount_with_usd(amount) if amount else 'Variable'
-        fee_usd = await format_amount_with_usd(final_fee)
-        total_usd = await format_amount_with_usd(total)
+        amount_usd = await format_amount_with_usd(amount, user_id) if amount else 'Variable'
+        fee_usd = await format_amount_with_usd(final_fee, user_id)
+        total_usd = await format_amount_with_usd(total, user_id)
 
         # Build recipient info if sending to username
         recipient_text = ""
@@ -3484,21 +3540,23 @@ async def prepare_and_show_fee(event, user_id, invoice, amount):
             else:
                 bot_status = "⚠️"
 
-            recipient_text = f"👤 To: @{ru['username']} ({_md_escape(str(ru['display_name']))}) {bot_status}\n\n"
+            recipient_text = t(user_id, "pay_to_line", username=ru['username'],
+                                name=_md_escape(str(ru['display_name'])),
+                                status=bot_status)
 
             if ru['is_channel'] or ru['is_group']:
-                recipient_tips = "\n\n⚠️ _Group/Channel wallet - notify admin!_"
+                recipient_tips = t(user_id, "pay_tip_group")
             elif not has_started:
-                recipient_tips = "\n\n⚠️ _Recipient hasn't started bot - won't be notified!_"
+                recipient_tips = t(user_id, "pay_tip_notstarted")
             # If has_started is True, no warning needed
 
             # Anonymous sender option (default: show sender)
             is_anonymous = user_data[user_id].get('send_anonymous', False)
             if is_anonymous:
-                anon_text = "👻 Sender: **Anonymous**"
+                anon_text = t(user_id, "pay_sender_anon")
                 anon_btn = Button.inline(t(user_id, "btn_show_name"), b"toggle_send_anon")
             else:
-                anon_text = "👤 Sender: **Visible**"
+                anon_text = t(user_id, "pay_sender_visible")
                 anon_btn = Button.inline(t(user_id, "btn_anon"), b"toggle_send_anon")
 
             recipient_text += f"{anon_text}\n\n"
@@ -3507,7 +3565,7 @@ async def prepare_and_show_fee(event, user_id, invoice, amount):
         # Add password hint if user doesn't have one
         password_hint = ""
         if not has_send_password(user_id):
-            password_hint = "\n💡 _Set a send password in Settings for security_"
+            password_hint = t(user_id, "pay_pw_hint")
 
         buttons.append([
             Button.inline(t(user_id, "btn_confirm"), b"confirm_payment_yes"),
@@ -3515,20 +3573,16 @@ async def prepare_and_show_fee(event, user_id, invoice, amount):
         ])
 
         _q = (user_data.get(user_id) or {}).get('send_queue') or []
-        _q_txt = (build_queue_text(_q)[0] + "\n\n" + "─" * 10 + "\n🔹 **New payment:**\n") if _q else ""
+        _q_txt = (build_queue_text(_q, user_id)[0] + "\n\n" + "─" * 10 + "\n" + t(user_id, "queue_new_payment") + "\n") if _q else ""
         await res.edit(
-            _q_txt + f"📋 **Payment Summary**\n\n"
-            f"{recipient_text}"
-            f"💰 Amount: {amount_usd}\n"
-            f"⚡ Fee: {fee_usd}\n"
-            f"💳 Total: {total_usd}\n\n"
-            f"Confirm payment?{recipient_tips}{password_hint}",
+            _q_txt + t(user_id, "pay_summary", recipient=recipient_text, amount=amount_usd,
+                       fee=fee_usd, total=total_usd, tips=recipient_tips, hint=password_hint),
             buttons=buttons
         )
 
     except Exception as error:
         await res.edit(
-            f"❌ Error preparing payment:\n{error}",
+            t(user_id, "pay_prep_err", error=str(error)),
             buttons=_row_back_menu(user_id)
         )
         if user_id in user_steps:
@@ -3562,9 +3616,9 @@ async def start_command(event):
             payment = await get_payment_by_id(user_id, payment_id)
 
             if payment:
-                details_text = await format_payment_details(payment, payment_id)
+                details_text = await format_payment_details(payment, payment_id, user_id=user_id)
 
-                share_row = payment_share_button(payment_id)
+                share_row = payment_share_button(payment_id, user_id=user_id)
                 await event.respond(
                     details_text,
                     buttons=[
@@ -3576,9 +3630,7 @@ async def start_command(event):
                 return
             else:
                 await event.respond(
-                    f"❌ **Payment Not Found**\n\n"
-                    f"ID: `{payment_id}`\n\n"
-                    f"This payment may have expired.",
+                    t(user_id, "pay_not_found", pid=payment_id),
                     buttons=_row_back_menu(user_id)
                 )
                 return
@@ -3606,7 +3658,7 @@ async def payment_details_command(event):
     # Extract payment ID from command
     match = re.match(r'/dt_(.+)', event.text)
     if not match:
-        await event.respond("❌ Invalid payment ID")
+        await event.respond(t(user_id, "dt_invalid_id"))
         return
 
     payment_id = match.group(1).strip()
@@ -3618,8 +3670,8 @@ async def payment_details_command(event):
     payment = await get_payment_by_id(user_id, payment_id)
 
     if payment:
-        details_text = await format_payment_details(payment, payment_id)
-        share_row = payment_share_button(payment_id)
+        details_text = await format_payment_details(payment, payment_id, user_id=user_id)
+        share_row = payment_share_button(payment_id, user_id=user_id)
 
         btns = ([share_row] if share_row else []) + [
             [Button.inline(t(user_id, "btn_history"), b"history")],
@@ -3628,9 +3680,7 @@ async def payment_details_command(event):
         await event.respond(details_text, buttons=btns)
     else:
         await event.respond(
-            f"❌ **Payment Not Found**\n\n"
-            f"ID: `{payment_id}`\n\n"
-            f"This payment may have expired.",
+            t(user_id, "pay_not_found", pid=payment_id),
             buttons=_row_back_menu(user_id)
         )
 
@@ -3659,9 +3709,7 @@ async def _cb_signmsg_help(event, user_id):
     """signmsg_help leaf (item 26): static sign/verify help screen."""
     await event.answer()
     await event.edit(
-        "✍️ **Sign / Verify Message**\n\nProve wallet ownership:\n\n"
-        "• `/signmsg <message>` — sign\n"
-        "• `/verifymsg <pubkey> <signature> <message>` — verify",
+        t(user_id, "signmsg_help"),
         buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
 
 
@@ -3670,9 +3718,7 @@ async def _cb_del_lnaddress(event, user_id):
     taps must not delete instantly."""
     await event.answer()
     await event.edit(
-        "⚠️ **Delete Lightning Address?**\n\n"
-        "This cannot be undone. Your LN address will be removed "
-        "and others can't pay you via it anymore.",
+        t(user_id, "lnaddr_del_confirm"),
         buttons=[
             [Button.inline(t(user_id, "btn_del_yes"), b"del_lnaddress_confirm")],
             [Button.inline(t(user_id, "btn_cancel"), b"change_ln_address")]
@@ -3776,12 +3822,12 @@ async def callback_handler(event):
                 if bounds.get("min_usd"):
                     mn = bounds["min_usd"]
                     mn_sats = usd_to_sats(mn, usd_rate)
-                    s = f" (~{mn_sats:,} sats)" if mn_sats else ""
+                    s = f" (~{mn_sats:,} {t(user_id, 'sats_unit')})" if mn_sats else ""
                     note_lines.append(t(user_id, "dep_min_note", amount=f"{mn:g}", sats=s))
                 if bounds.get("max_usd"):
                     mx = bounds["max_usd"]
                     mx_sats = usd_to_sats(mx, usd_rate)
-                    s = f" (~{mx_sats:,} sats)" if mx_sats else ""
+                    s = f" (~{mx_sats:,} {t(user_id, 'sats_unit')})" if mx_sats else ""
                     note_lines.append(t(user_id, "dep_max_note", amount=f"{mx:g}", sats=s))
                 min_note = ("\n" + "\n".join(note_lines)) if note_lines else ""
                 await event.edit(
@@ -4082,12 +4128,7 @@ async def callback_handler(event):
             user_steps[user_id] = "calc_input"
             fiat_code = get_user_fiat(user_id)
             await event.edit(
-                "🧮 **Satoshi / Bitcoin / Fiat Calculator**\n\n"
-                "Send an amount with a unit:\n\n"
-                "• `5000 sats`  (or just `5000`)\n"
-                "• `0.001 btc`\n"
-                f"• `$10`  (in {fiat_code})\n\n"
-                "I'll convert it to sats, BTC, and fiat.",
+                t(user_id, "calc_title", fiat=fiat_code),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"more_tools")]])
             return
 
@@ -4097,35 +4138,35 @@ async def callback_handler(event):
             return
 
         if data == "buy":
-            await event.answer("🟧 Loading...")
+            await event.answer(t(user_id, "load_generic"))
             try:
                 url = await buy_bitcoin_url(user_id)
-                await event.edit(f"🟧 **Buy Bitcoin**\n\n{url}",
+                await event.edit(t(user_id, "buy_bitcoin", url=url),
                                  buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]],
                                  link_preview=False)
             except Exception as e:
-                await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
+                await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
             return
 
         if data == "fees":
-            await event.answer("⛽ Loading...")
+            await event.answer(t(user_id, "load_fees"))
             try:
                 fees = await get_recommended_fees(user_id)
-                await event.edit(_format_fees(fees),
+                await event.edit(_format_fees(fees, user_id),
                                  buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
             except Exception as e:
-                await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
+                await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
             return
 
         if data == "sync":
-            await event.answer("🔄 Syncing...")
+            await event.answer(t(user_id, "syncing"))
             try:
                 info = await sync_user_wallet(user_id)
                 await event.edit(
                     t(user_id, "synced", balance=f"{getattr(info, 'balance_sats', 0):,}"),
                     buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
             except Exception as e:
-                await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
+                await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
             return
 
         if data == "signmsg_help":
@@ -4138,13 +4179,13 @@ async def callback_handler(event):
             return
 
         if data == "del_lnaddress_confirm":
-            await event.answer("🗑️ Deleting...")
+            await event.answer(t(user_id, "deleting"))
             try:
                 await delete_lightning_address(user_id)
-                await event.edit("✅ Lightning address deleted.",
+                await event.edit(t(user_id, "lnaddr_deleted"),
                                  buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]])
             except Exception as e:
-                await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]])
+                await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]])
             return
 
         if data.startswith("contactpay_"):
@@ -4152,14 +4193,14 @@ async def callback_handler(event):
             cmap = (user_data.get(user_id) or {}).get('contact_map') or {}
             contact = cmap.get(idx)
             if not contact:
-                await event.answer("Contact list expired — reopen Contacts.", alert=True)
+                await event.answer(t(user_id, "contact_expired"), alert=True)
                 return
             user_data.setdefault(user_id, {})['contact_pay'] = {
                 'name': contact['name'], 'identifier': contact['identifier']}
             user_steps[user_id] = "contact_pay_amount"
             await event.answer()
             await event.edit(
-                f"💸 Send to **{contact['name']}**\n\nEnter amount in **sats**:",
+                t(user_id, "contact_pay_prompt", name=contact['name']),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"contacts")]])
             return
 
@@ -4168,13 +4209,13 @@ async def callback_handler(event):
             cmap = (user_data.get(user_id) or {}).get('contact_map') or {}
             contact = cmap.get(idx)
             if not contact:
-                await event.answer("Contact list expired — reopen Contacts.", alert=True)
+                await event.answer(t(user_id, "contact_expired"), alert=True)
                 return
             try:
                 await delete_user_contact(user_id, contact['id'])
-                await event.answer("🗑️ Deleted", alert=True)
+                await event.answer(t(user_id, "contact_deleted_alert"), alert=True)
             except Exception as de:
-                await event.answer(f"⚠️ Couldn't delete: {de}. Try again.", alert=True)
+                await event.answer(t(user_id, "contact_del_failed", error=str(de)), alert=True)
                 return
             await show_contacts(event, edit=True)
             return
@@ -4185,19 +4226,19 @@ async def callback_handler(event):
             if not prep:
                 await event.answer(t(user_id, "session_expired"), alert=True)
                 return
-            await event.answer("Sending...")
+            await event.answer(t(user_id, "sending"))
             try:
                 await send_payment(user_id, prep)
             except Exception as se:
                 user_steps.pop(user_id, None)
-                await event.edit(f"❌ Payment failed: {se}",
+                await event.edit(t(user_id, "contact_pay_failed", error=str(se)),
                                  buttons=[[Button.inline(t(user_id, "btn_back_contacts"), b"contacts")]])
                 return
             name = cp.get('name', 'contact')
             user_steps.pop(user_id, None)
             (user_data.get(user_id) or {}).pop('contact_pay', None)
             await event.edit(
-                f"✅ **Payment Sent!**\n\nSent to **{name}**.",
+                t(user_id, "contact_sent", name=name),
                 buttons=_row_back_menu(user_id))
             return
 
@@ -4214,7 +4255,7 @@ async def callback_handler(event):
         if data == "refresh":
             await event.edit("⏳")
             await show_main_menu(event, edit=True)
-            await event.answer("✅ Refreshed")
+            await event.answer(t(user_id, "refresh_done"))
             return
 
         elif data == "help":
@@ -4234,15 +4275,15 @@ async def callback_handler(event):
         elif data.startswith("track_"):
             # Track payment by ID - use the reusable helper
             payment_id = data[6:]  # Remove "track_" prefix
-            await event.answer("🔍 Loading...")
+            await event.answer(t(user_id, "load_search"))
 
             logging.info(f"[track_] user={user_id} searching for payment_id={payment_id!r}")
 
             payment = await get_payment_by_id(user_id, payment_id)
 
             if payment:
-                details_text = await format_payment_details(payment, payment_id)
-                share_row = payment_share_button(payment_id)
+                details_text = await format_payment_details(payment, payment_id, user_id=user_id)
+                share_row = payment_share_button(payment_id, user_id=user_id)
 
                 btns = ([share_row] if share_row else []) + [
                     [Button.inline(t(user_id, "btn_history"), b"history")],
@@ -4261,20 +4302,18 @@ async def callback_handler(event):
                     logging.error(f"[track_] Debug list failed: {e}")
 
                 await event.edit(
-                    f"❌ **Payment Not Found**\n\n"
-                    f"No payment found with ID:\n`{payment_id}`\n\n"
-                    f"Make sure you entered the correct payment ID.",
+                    t(user_id, "pay_not_found_id", pid=payment_id),
                     buttons=_row_back_menu(user_id)
                 )
             return
 
         elif data == "exit_confirm":
-            await event.answer("🚨 Signing...")
+            await event.answer(t(user_id, "signing"))
             ud = user_data.get(user_id) or {}
             prep = ud.get('exit_prepared')
             addr = ud.get('exit_address', '?')
             if not prep:
-                await event.edit("❌ Prepared exit expired — start again.", buttons=None)
+                await event.edit(t(user_id, "exit_expired"), buttons=None)
                 return
             try:
                 sdk = await get_wallet(user_id)
@@ -4291,7 +4330,7 @@ async def callback_handler(event):
                 )
                 txs = list(getattr(resp, 'transactions', []) or [])
                 if not txs:
-                    await event.edit("❌ No transactions produced.", buttons=None)
+                    await event.edit(t(user_id, "exit_no_txs"), buttons=None)
                     return
                 # v34: persist per-tx kind/status/deps so the user can broadcast
                 # correctly per docs (package relay, order, timelocks).
@@ -4307,25 +4346,17 @@ async def callback_handler(event):
                 recov = int(getattr(resp, 'recoverable_value_sat', 0) or 0)
                 fee = int(getattr(resp, 'total_fee_sat', 0) or 0)
                 n_confirmed = sum(1 for x in ud['exit_signed_txs'] if 'Confirmed' in x['status'])
-                lines = [f"✅ **Signed! {len(txs)} transaction(s) ready** — NOT broadcast yet.\n"]
+                lines = [t(user_id, "exit_signed_hdr", n=len(txs))]
                 for i, x in enumerate(ud['exit_signed_txs'], 1):
                     kind_tag = x['kind'].split('.')[-1].rstrip('()') if x['kind'] else f"tx{i}"
-                    status_tag = " ✅already on-chain (skip)" if 'Confirmed' in x['status'] else ""
-                    lines.append(f"{i}. [{kind_tag}] `{x['txid'][:24]}…` ({len(x['hex'])//2}B){status_tag}")
+                    status_tag = (t(user_id, "exit_onchain_tag") if 'Confirmed' in x['status'] else "")
+                    lines.append(t(user_id, "exit_tx_line", i=i, kind=kind_tag,
+                                   txid=x['txid'][:24], size=len(x['hex'])//2, status=status_tag))
                 if n_confirmed:
-                    lines.append(f"\nℹ️ {n_confirmed} step(s) already on-chain — those are free, skip them.")
-                lines.append(f"\n💰 Value: {recov:,} sats \u2014 ⛽ Fee: {fee:,} sats")
-                lines.append(f"🏠 To: `{addr}`\n")
-                lines.append(
-                    "📡 **How to broadcast (important):**\n"
-                    "• Broadcast in the order above — each tx depends on the ones before it.\n"
-                    "• Pairs: each tx with a `cpfp:` line must go WITH its CPFP child in one package "
-                    "(`bitcoin-cli submitpackage '[\"<parent>\",\"<child>\"]'`). Public APIs reject "
-                    "the zero-fee parent alone.\n"
-                    "• Txs WITHOUT a cpfp line (fan-out / sweep) broadcast alone, anywhere "
-                    "(e.g. mempool.space/api/tx).\n"
-                    "• Some steps have timelocks — wait for them to mature before broadcasting "
-                    "(can take days; that's normal for emergency exits).")
+                    lines.append(t(user_id, "exit_onchain_note", n=n_confirmed))
+                lines.append(t(user_id, "exit_value_line", recov=f"{recov:,}", fee=f"{fee:,}"))
+                lines.append(t(user_id, "exit_to_line", addr=addr))
+                lines.append(t(user_id, "exit_broadcast_help"))
                 await event.answer()
                 # v34: send raw hex as message + file, NO broadcast button
                 hex_payload = "\n\n".join(
@@ -4340,15 +4371,14 @@ async def callback_handler(event):
                 await client.send_file(event.chat_id, io.BytesIO(hex_payload.encode()),
                                        force_document=True,
                                        attributes=[tl_types.DocumentAttributeFilename(fname)],
-                                       caption="📝 Signed exit tx hex — broadcast manually from any explorer/node.")
+                                       caption=t(user_id, "exit_file_caption"))
                 await event.edit("\n".join(lines), buttons=[
                     [Button.inline(t(user_id, "btn_exit_menu"), b"emergency_exit")]
                 ])
             except Exception as e:
                 logging.error(f"exit sign: {e}")
                 await event.edit(
-                    f"❌ Signing failed: {e}\n\n"
-                    f"💡 Use 💾 Export State instead — import it in a compatible wallet to recover.",
+                    t(user_id, "exit_sign_failed", error=str(e)),
                     buttons=[[Button.inline(t(user_id, "btn_exit_menu"), b"emergency_exit")]])
             return
 
@@ -4360,18 +4390,7 @@ async def callback_handler(event):
         elif data == "emergency_exit":
             await event.answer()
             await event.edit(
-                "🚨 **Emergency Exit** — last resort only\n\n"
-                "Pulls your Spark balance on-chain **without** asking the "
-                "Spark operators. Use it when Spark is down or you don't "
-                "trust it anymore.\n\n"
-                "**Before you start:**\n"
-                "• Needs an on-chain UTXO of yours to pay the fees — a "
-                "wallet that only holds Spark sats **cannot** exit.\n"
-                "• Multi-step with timelocks — a full exit can take days.\n"
-                "• You broadcast the transactions yourself (bot gives you "
-                "the signed hex, never sends it).\n\n"
-                "💡 Spark still working? **📤 Send → Bitcoin address** is "
-                "cheaper and instant.",
+                t(user_id, "exit_menu"),
                 buttons=[
                     [Button.inline(t(user_id, "btn_export_bk"), b"exit_export_state")],
                     [Button.inline(t(user_id, "btn_quote_exit"), b"exit_prepare")],
@@ -4380,44 +4399,41 @@ async def callback_handler(event):
             return
 
         elif data == "exit_export_state":
-            await event.answer("💾 Exporting...")
+            await event.answer(t(user_id, "exporting"))
             try:
                 sdk = await get_wallet(user_id)
                 resp = await sdk.export_unilateral_exit_state()
                 state = getattr(resp, 'exit_state', None) or str(resp)
                 fname = f"zap-exit-state-{user_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-                out = f"💾 **Exit State Backup**\n\nSave this somewhere safe.\n\n```{state[:3500]}```"
+                out = t(user_id, "exit_export_card", state=state[:3500])
                 if len(state) > 3500:
                     await client.send_file(event.chat_id, io.BytesIO(state.encode()),
                                            force_document=True,
                                            attributes=[tl_types.DocumentAttributeFilename(fname)],
-                                           caption=f"💾 Unilateral exit state backup\n📄 {fname}")
-                    out = "✅ State exported as a JSON file — store it safely."
+                                           caption=t(user_id, "exit_export_caption", fname=fname))
+                    out = t(user_id, "exit_export_done")
                 await event.edit(out, buttons=[[Button.inline(t(user_id, "btn_exit_menu"), b"emergency_exit")]])
             except Exception as e:
-                await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_exit_menu"), b"emergency_exit")]])
+                await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_exit_menu"), b"emergency_exit")]])
             return
 
         elif data == "exit_prepare":
             await event.answer()
             user_steps[user_id] = "exit_address_input"
             await event.edit(
-                "🚨 **Force Withdraw to Onchain Address**\n\n"
-                "Send the Bitcoin address that should receive your funds:\n"
-                "(bc1... / 1... / 3...)\n\n"
-                "⚠️ On-chain fees apply. Double-check the address!",
+                t(user_id, "fw_prompt"),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"emergency_exit")]])
             return
 
         elif data == "webhook_list":
-            await event.answer("🔗 Loading webhooks...")
+            await event.answer(t(user_id, "load_webhooks"))
             try:
                 sdk = await get_wallet(user_id)
                 hooks = await sdk.list_webhooks() or []
                 if not hooks:
-                    txt = "🔗 **Webhooks**\n\nNone registered."
+                    txt = t(user_id, "wh_none")
                 else:
-                    lines = ["🔗 **Your Webhooks**\n"]
+                    lines = [t(user_id, "wh_list_title")]
                     for w in hooks:
                         lines.append(f"• `{getattr(w,'url','?')}`")
                     txt = "\n".join(lines)
@@ -4428,15 +4444,14 @@ async def callback_handler(event):
                         [Button.inline(t(user_id, "btn_back_settings"), b"settings")]
                     ])
             except Exception as e:
-                await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]])
+                await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]])
             return
 
         elif data == "webhook_add":
             await event.answer()
             user_steps[user_id] = "webhook_url_input"
             await event.edit(
-                "➕ **Register Webhook**\n\n"
-                "Send the HTTPS URL that should receive payment events:",
+                t(user_id, "wh_add"),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"webhook_list")]])
             return
 
@@ -4444,8 +4459,7 @@ async def callback_handler(event):
             await event.answer()
             user_steps[user_id] = "webhook_del_input"
             await event.edit(
-                "➖ **Remove Webhook**\n\n"
-                "Send the webhook ID (or its URL) to remove:",
+                t(user_id, "wh_del"),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"webhook_list")]])
             return
 
@@ -4462,7 +4476,7 @@ async def callback_handler(event):
                 ud.pop('batch_auth_pending', None)
             _batch_clear(user_id)  # the durable batch queue is cleared too
             user_steps.pop(user_id, None)
-            await event.edit("\U0001f5d1\ufe0f Queue cleared.",
+            await event.edit(t(user_id, "queue_cleared"),
                              buttons=_row_back_menu(user_id))
             return
 
@@ -4475,12 +4489,11 @@ async def callback_handler(event):
             await event.answer()
             ud = user_data.get(user_id) or {}
             if not ud.get('batch_items'):
-                await event.edit("❌ Batch is empty — start Batch Pay again.", buttons=None)
+                await event.edit(t(user_id, "batch_empty_restart"), buttons=None)
                 return
             user_steps[user_id] = "batch_dest"
             await event.edit(
-                f"📢 **Recipient {len(ud['batch_items']) + 1}** — send the destination:\n"
-                f"(invoice / LN address / @username / btc address)",
+                t(user_id, "batch_recipient_prompt", n=len(ud['batch_items']) + 1),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"more_tools")]])
             return
 
@@ -4495,13 +4508,7 @@ async def callback_handler(event):
             user_data[user_id].pop('batch_auth_pending', None)
             user_steps[user_id] = "batch_dest"
             await event.edit(
-                "📢 **Batch Pay** — pay many people at once\n\n"
-                "**Recipient 1** \u2014 send me the destination:\n\n"
-                "• Lightning invoice (`lnbc...`)\n"
-                "• Lightning address (`name@domain`)\n"
-                "• Telegram username (`@user`)\n"
-                "• Bitcoin address (`bc1...`)\n\n"
-                "If the invoice has no amount, I'll ask for it.",
+                t(user_id, "batch_intro"),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"more_tools")]]
             )
             return
@@ -4511,29 +4518,28 @@ async def callback_handler(event):
             return
 
         elif data == "conversion_limits":
-            await event.answer("📊 Checking limits...")
+            await event.answer(t(user_id, "load_limits"))
             try:
                 sdk = await get_wallet(user_id)
                 resp = await sdk.fetch_conversion_limits(FetchConversionLimitsRequest())
                 await event.edit(
-                    f"📊 **Conversion Limits**\n\n"
-                    f"`{resp}`",
+                    t(user_id, "conv_limits", resp=resp),
                     buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
             except Exception as e:
-                await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
+                await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
             return
 
         elif data == "refund_conversions":
-            await event.answer("🔨 Refunding stuck conversions...")
+            await event.answer(t(user_id, "refunding_convs"))
             try:
                 sdk = await get_wallet(user_id)
                 resp = await sdk.refund_pending_conversions()
                 n = len(getattr(resp, 'refunds', []) or [])
                 await event.edit(
-                    f"✅ Refund scan done — {n} pending conversion(s) refunded.",
+                    t(user_id, "refund_convs_done", n=n),
                     buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
             except Exception as e:
-                await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
+                await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]])
             return
 
         elif data == "settings":
@@ -4574,10 +4580,9 @@ async def callback_handler(event):
             if has_send_password(user_id):
                 user_steps[user_id] = "verify_password_for_backup"
                 hint = get_password_hint(user_id)
-                hint_text = f"\n\n💡 Hint: {hint}" if hint else ""
+                hint_text = t(user_id, "pw_hint_hint", hint=hint) if hint else ""
                 await event.edit(
-                    f"🔒 **Password Required**\n\n"
-                    f"Enter your password to view backup seeds:{hint_text}",
+                    t(user_id, "pw_required_backup", hint=hint_text),
                     buttons=[
                         [Button.inline(t(user_id, "btn_cancel"), b"settings_back")]
                     ]
@@ -4591,12 +4596,7 @@ async def callback_handler(event):
                 encrypted_seed = db.get(f'{user_id}')
                 seed = decrypt_seed(encrypted_seed)
                 await event.edit(
-                    f"🔐 **Your recovery phrase**\n\n"
-                    f"`{seed}`\n\n"
-                    f"📝 Write it down on paper.\n"
-                    f"🚫 Never share it — anyone with these 12 words can "
-                    f"steal your wallet.\n"
-                    f"📸 Screenshots are risky (cloud backups).",
+                    t(user_id, "seed_show", seed=seed),
                     buttons=_row_cancel_settings(user_id)
                 )
 
@@ -4604,10 +4604,7 @@ async def callback_handler(event):
             user_steps[user_id] = "recovery_input"
             await event.answer()
             await event.edit(
-                "🔄 **Wallet Recovery**\n\n"
-                "Enter your 12-word recovery phrase:\n"
-                "(Separate words with spaces)\n\n"
-                "⚠️ **Warning:** Your current wallet will be replaced!",
+                t(user_id, "recovery_card"),
                 buttons=_row_cancel_settings(user_id)
             )
 
@@ -4617,10 +4614,8 @@ async def callback_handler(event):
                 await event.answer()
                 if address and getattr(address, 'lightning_address', None):
                     await event.edit(
-                        f"⚡ **Your Lightning Address:**\n"
-                        f"`{address.lightning_address}`\n\n"
-                        f"🔗 **LNURL:**\n`{address.lnurl}`\n\n"
-                        "Change or delete it below.",
+                        t(user_id, "lnaddr_current",
+                          addr=address.lightning_address, lnurl=address.lnurl),
                         buttons=[
                             [Button.inline(t(user_id, "btn_chaddr"), b"confirm_change_ln_address")],
                             [Button.inline(t(user_id, "btn_del_addr"), b"del_lnaddress")],
@@ -4629,50 +4624,42 @@ async def callback_handler(event):
                     )
                 else:
                     await event.edit(
-                        "⚡ **Lightning Address**\n\n"
-                        "You don't have one yet. Register a reusable address "
-                        "(e.g. `yourname`) to receive payments easily.",
+                        t(user_id, "lnaddr_none"),
                         buttons=[
                             [Button.inline(t(user_id, "btn_regaddr"), b"confirm_change_ln_address")],
                             [Button.inline(t(user_id, "btn_back_settings"), b"settings")]
                         ]
                     )
             except Exception as error:
-                await event.answer(f"❌ Error: {error}", alert=True)
+                await event.answer(t(user_id, "err_alert_line", error=str(error)), alert=True)
 
         elif data == "confirm_change_ln_address":
             user_steps[user_id] = "change_ln_address_input"
             await event.edit(
-                "✏️ **Change Lightning Address**\n\n"
-                "Enter your desired username:\n"
-                "(Only lowercase letters, numbers, and underscores)\n\n"
-                "Example: `my_wallet`\n\n"
-                "⚠️ Note: Username must be unique!",
+                t(user_id, "lnaddr_change"),
                 buttons=_row_cancel_settings(user_id)
             )
 
         # ==================== PRIVATE MODE ====================
         elif data == "toggle_private_mode":
-            await event.answer("⏳ Updating...")
+            await event.answer(t(user_id, "updated"))
             current_mode = await get_private_mode(user_id)
             new_mode = not current_mode
             success = await set_private_mode(user_id, new_mode)
 
             if success:
-                status_text = "enabled" if new_mode else "disabled"
+                status_text = t(user_id, "pmode_enabled") if new_mode else t(user_id, "pmode_disabled")
                 status_icon = "✅" if new_mode else "❌"
-                privacy_note = "🔒 Your transactions are now private." if new_mode else "🔓 Your transactions are now visible."
+                privacy_note = (t(user_id, "pmode_status_on") if new_mode
+                                else t(user_id, "pmode_status_off"))
                 await event.edit(
-                    f"👻 **Private Mode {status_icon}**\n\n"
-                    f"Private mode has been **{status_text}**.\n\n"
-                    f"{privacy_note}\n\n"
-                    f"⚠️ Note: This setting affects how your payments are stored on Spark network.",
+                    t(user_id, "pmode_card", icon=status_icon, status=status_text,
+                      note=privacy_note),
                     buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]]
                 )
             else:
                 await event.edit(
-                    "❌ **Error**\n\n"
-                    "Failed to update private mode. Please try again.",
+                    t(user_id, "pmode_failed"),
                     buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]]
                 )
             return
@@ -4709,14 +4696,13 @@ async def callback_handler(event):
                 buttons.append([Button.inline(t(user_id, "btn_back_settings"), b"settings")])
 
                 await event.edit(
-                    f"💱 **Select Fiat Currency**\n\n"
-                    f"Current: {current_emoji} **{current_fiat}**",
+                    t(user_id, "fiat_select", emoji=current_emoji, fiat=current_fiat),
                     buttons=buttons
                 )
             except Exception as error:
                 logging.error(f"Error loading fiat currencies: {error}")
                 await event.edit(
-                    f"❌ Error loading currencies: {error}",
+                    t(user_id, "fiat_load_err", error=str(error)),
                     buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]]
                 )
 
@@ -4743,8 +4729,8 @@ async def callback_handler(event):
                 buttons.append(row)
             buttons.append([Button.inline(t(user_id, "btn_back_settings"), b"settings")])
             await event.edit(
-                f"💱 **{t(user_id, 'btn_change_fiat')}**\n\n"
-                f"{t(user_id, 'btn_change_fiat')}: {fiat_emoji} **{current_fiat}**",
+                t(user_id, "fiat_header", title=t(user_id, 'btn_change_fiat'),
+                  emoji=fiat_emoji, fiat=current_fiat),
                 buttons=buttons
             )
 
@@ -4753,23 +4739,23 @@ async def callback_handler(event):
             ud = user_data.get(user_id) or {}
             auth_req = ud.get('lnurl_auth_request')
             if not auth_req:
-                await event.answer("Nothing pending to authenticate.", alert=True)
+                await event.answer(t(user_id, "lnurl_auth_none"), alert=True)
                 return
             await event.answer()
-            await event.edit("⏳ Authenticating...")
+            await event.edit(t(user_id, "authenticating"))
             try:
                 auth_sdk = await get_wallet(user_id)
                 auth_result = await auth_sdk.lnurl_auth(request_data=auth_req)
                 if isinstance(auth_result, LnurlCallbackStatus.OK):
-                    await event.edit("✅ **Authenticated successfully!**")
+                    await event.edit(t(user_id, "lnurl_auth_ok"))
                 elif isinstance(auth_result, LnurlCallbackStatus.ERROR_STATUS):
                     auth_reason = getattr(
                         getattr(auth_result, 'error_details', None), 'reason', 'unknown')
-                    await event.edit(f"❌ **Auth failed:** {auth_reason}")
+                    await event.edit(t(user_id, "lnurl_auth_failed", reason=auth_reason))
                 else:
-                    await event.edit(f"❌ Unexpected auth result: {auth_result}")
+                    await event.edit(t(user_id, "lnurl_auth_unexpected", result=auth_result))
             except Exception as auth_err:
-                await event.edit(f"❌ **Auth error:** {str(auth_err)[:150]}")
+                await event.edit(t(user_id, "lnurl_auth_err", error=str(auth_err)[:150]))
             user_data[user_id] = {}
             return
 
@@ -4777,43 +4763,44 @@ async def callback_handler(event):
         elif data == "unclaimed_deposits":
             await event.answer()
             try:
-                await event.edit("⏳ Checking unclaimed deposits...")
+                await event.edit(t(user_id, "checking_deposits"))
                 sdk = await get_wallet(user_id)
                 response = await sdk.list_unclaimed_deposits(ListUnclaimedDepositsRequest())
                 deposits = response.deposits
 
                 if not deposits:
                     await event.edit(
-                        "📦 **Unclaimed Deposits**\n\n"
-                        "✅ No unclaimed deposits found.",
+                        t(user_id, "dep_none"),
                         buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]]
                     )
                     return
 
-                text = "📦 **Unclaimed Deposits**\n\n"
+                text = t(user_id, "dep_list_title")
                 buttons = []
                 for i, dep in enumerate(deposits):
-                    amount_display = f"{dep.amount_sats:,} sats"
+                    amount_display = f"{dep.amount_sats:,} {t(user_id, 'sats_unit')}"
                     error_text = ""
                     if dep.claim_error:
                         if isinstance(dep.claim_error, DepositClaimError.MAX_DEPOSIT_CLAIM_FEE_EXCEEDED):
                             req_fee = getattr(dep.claim_error, 'required_fee_sats', None)
                             req_rate = getattr(dep.claim_error, 'required_fee_rate_sat_per_vbyte', None)
                             if req_rate:
-                                error_text = f" ⚠️ Fee exceeded (need {req_rate} sat/vB)"
+                                error_text = t(user_id, "dep_fee_exceeded_rate", rate=req_rate)
                             elif req_fee:
-                                error_text = f" ⚠️ Fee exceeded (need {req_fee} sats)"
+                                error_text = t(user_id, "dep_fee_exceeded_sats", fee=req_fee)
                             else:
-                                error_text = " ⚠️ Fee exceeded"
+                                error_text = t(user_id, "dep_fee_exceeded")
                         elif isinstance(dep.claim_error, DepositClaimError.MISSING_UTXO):
-                            error_text = " ❌ Missing UTXO"
+                            error_text = t(user_id, "dep_missing_utxo")
                         elif isinstance(dep.claim_error, DepositClaimError.GENERIC):
                             msg = getattr(dep.claim_error, 'message', '')
-                            error_text = f" ❌ {msg}" if msg else " ❌ Error"
+                            error_text = (t(user_id, "dep_err_line", error=msg) if msg
+                                          else t(user_id, "dep_generic_err"))
                         else:
-                            error_text = " ❌ Error"
+                            error_text = t(user_id, "dep_generic_err")
 
-                    text += f"**{i+1}.** `{dep.txid[:12]}...:{dep.vout}` — **{amount_display}**{error_text}\n"
+                    text += t(user_id, "dep_item_line", i=i+1, txid=dep.txid[:12],
+                              vout=dep.vout, amount=amount_display, error=error_text) + "\n"
 
                     # Store deposit info for later use
                     dep_key = f"{dep.txid}:{dep.vout}"
@@ -4835,14 +4822,14 @@ async def callback_handler(event):
 
                     buttons.append([Button.inline(t(user_id, "btn_claim_n", i=i+1, amt=amount_display), f"ucl_{i}".encode())])
 
-                text += "\n**⚡ Claim** = swap to Lightning\n**↩️ Refund** = send to BTC address"
+                text += t(user_id, "dep_legend")
                 buttons.append([Button.inline(t(user_id, "btn_back_settings"), b"settings")])
 
                 await event.edit(text, buttons=buttons)
 
             except Exception as e:
                 logging.error(f"Error listing unclaimed deposits: {e}")
-                await event.edit(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]])
+                await event.edit(t(user_id, "err_alert_line", error=e), buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]])
 
         elif data.startswith("ucl_") and not data.startswith("ucl_fee_") and not data.startswith("ucl_claim") and not data.startswith("ucl_refund"):
             # Show claim/refund options for a specific deposit by index
@@ -4853,7 +4840,7 @@ async def callback_handler(event):
                 deposits_list = ud.get('unclaimed_list', [])
 
                 if idx >= len(deposits_list):
-                    await event.edit("❌ Deposit not found. Try again.", buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
+                    await event.edit(t(user_id, "dep_not_found_retry"), buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
                     return
 
                 deposit = deposits_list[idx]
@@ -4861,14 +4848,11 @@ async def callback_handler(event):
                 ud['claim_txid'] = deposit['txid']
                 ud['claim_vout'] = deposit['vout']
 
-                amount_display = f"{deposit['amount_sats']:,} sats"
+                amount_display = f"{deposit['amount_sats']:,} {t(user_id, 'sats_unit')}"
 
                 await event.edit(
-                    f"📦 **Deposit Details**\n\n"
-                    f"💰 Amount: **{amount_display}**\n"
-                    f"🔗 TXID: `{deposit['txid']}`\n"
-                    f"📍 Vout: {deposit['vout']}\n\n"
-                    f"Choose an action:",
+                    t(user_id, "dep_details", amount=amount_display,
+                      txid=deposit['txid'], vout=deposit['vout']),
                     buttons=[
                         [Button.inline(t(user_id, "btn_claim_ln"), b"ucl_claim")],
                         [Button.inline(t(user_id, "btn_refund_btc"), b"ucl_refund")],
@@ -4877,7 +4861,7 @@ async def callback_handler(event):
                 )
             except Exception as e:
                 logging.error(f"Error showing deposit details: {e}")
-                await event.edit(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
+                await event.edit(t(user_id, "err_alert_line", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
 
         elif data == "ucl_claim":
             # Claim deposit to Lightning
@@ -4905,11 +4889,9 @@ async def callback_handler(event):
                     amount_sats = dep_info.get('amount_sats', 0)
                     net_amount = amount_sats - req_fee
                     await event.edit(
-                        f"⚡ **Claim Deposit**\n\n"
-                        f"💰 Amount: **{amount_sats:,} sats**\n"
-                        f"💸 Network Fee: **{req_fee:,} sats** ({req_rate} sat/vB)\n"
-                        f"📥 You receive: **~{net_amount:,} sats**\n\n"
-                        f"Confirm claim?",
+                        t(user_id, "claim_confirm_fee",
+                          amount=f"{amount_sats:,}", fee=f"{req_fee:,}",
+                          rate=req_rate, net=f"{net_amount:,}"),
                         buttons=[
                             [Button.inline(t(user_id, "btn_confirm_claim"), b"ucl_fee_required")],
                             [Button.inline(t(user_id, "btn_custom_fee"), b"ucl_fee_custom")],
@@ -4918,7 +4900,7 @@ async def callback_handler(event):
                     )
                 else:
                     # No required fee info — show fee speed options
-                    await event.edit("⏳ Getting network fees...")
+                    await event.edit(t(user_id, "getting_fees"))
                     sdk = await get_wallet(user_id)
                     rec_fees = await sdk.recommended_fees()
 
@@ -4931,9 +4913,7 @@ async def callback_handler(event):
                     }
 
                     await event.edit(
-                        f"⚡ **Claim Deposit**\n\n"
-                        f"🔗 TXID: `{txid[:24]}...`\n\n"
-                        f"Select network fee speed:",
+                        t(user_id, "claim_select_fee", txid=txid[:24]),
                         buttons=[
                             [Button.inline(t(user_id, "btn_fee_fast_r", rate=rec_fees.fastest_fee), b"ucl_fee_fast")],
                             [Button.inline(t(user_id, "btn_fee_medium_r", rate=rec_fees.half_hour_fee), b"ucl_fee_medium")],
@@ -4944,7 +4924,7 @@ async def callback_handler(event):
                     )
             except Exception as e:
                 logging.error(f"Error preparing claim: {e}")
-                await event.edit(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
+                await event.edit(t(user_id, "err_alert_line", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
 
         elif data == "ucl_refund":
             # Refund deposit to BTC address
@@ -4962,14 +4942,12 @@ async def callback_handler(event):
                 user_steps[user_id] = "ucl_refund_address"
 
                 await event.edit(
-                    f"↩️ **Refund Deposit**\n\n"
-                    f"🔗 TXID: `{txid[:24]}...`\n\n"
-                    f"Enter the BTC address to refund to:",
+                    t(user_id, "refund_prompt", txid=txid[:24]),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]]
                 )
             except Exception as e:
                 logging.error(f"Error preparing refund: {e}")
-                await event.edit(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
+                await event.edit(t(user_id, "err_alert_line", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
 
         elif data.startswith("ucl_fee_"):
             await event.answer()
@@ -4986,8 +4964,7 @@ async def callback_handler(event):
                 if fee_choice == "custom":
                     user_steps[user_id] = "ucl_custom_fee"
                     await event.edit(
-                        "✏️ Enter custom fee rate in **sat/vB**:\n\n"
-                        "Example: `10`",
+                        t(user_id, "custom_fee_prompt"),
                         buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]]
                     )
                     return
@@ -5014,21 +4991,21 @@ async def callback_handler(event):
                     else:  # slow (hour)
                         fee = MaxFee(onchain=MaxOnchainFee.RATE(sat_per_vbyte=rec.get('hour', 3)))
 
-                await event.edit("⏳ Claiming deposit...")
+                await event.edit(t(user_id, "claiming_deposit"))
                 sdk = await get_wallet(user_id)
                 request = ClaimDepositRequest(txid=txid, vout=vout, max_fee=fee)
                 result = await sdk.claim_deposit(request)
                 outcome = result.outcome
                 if outcome.is_SETTLED():
                     payment = outcome.payment
-                    amount_display = f"{payment.amount_sats:,} sats" if hasattr(payment, 'amount_sats') else "✅"
-                    msg = f"✅ **Deposit Claimed Successfully!**\n\n⚡ Payment received in Lightning wallet.\n💰 {amount_display}"
+                    amount_display = f"{payment.amount_sats:,} {t(user_id, 'sats_unit')}" if hasattr(payment, 'amount_sats') else "✅"
+                    msg = t(user_id, "claim_settled", amount=amount_display)
                 elif outcome.is_SUBMITTED():
-                    msg = "✅ **Deposit Claim Submitted!**\n\n⏳ Transfer submitted and will settle asynchronously."
+                    msg = t(user_id, "claim_submitted")
                 elif outcome.is_DEFERRED():
-                    msg = f"⏳ **Deposit Claim Deferred:** {outcome.reason}"
+                    msg = t(user_id, "claim_deferred", reason=outcome.reason)
                 else:
-                    msg = "✅ **Claim Request Processed**"
+                    msg = t(user_id, "claim_processed")
                 await event.edit(
                     msg,
                     buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]]
@@ -5036,7 +5013,7 @@ async def callback_handler(event):
 
             except Exception as e:
                 logging.error(f"Error claiming deposit: {e}")
-                await event.edit(f"❌ Claim failed: {e}", buttons=[[Button.inline(t(user_id, "btn_try_again"), b"unclaimed_deposits"), Button.inline(t(user_id, "btn_back_settings"), b"settings")]])
+                await event.edit(t(user_id, "claim_failed", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_try_again"), b"unclaimed_deposits"), Button.inline(t(user_id, "btn_back_settings"), b"settings")]])
 
         elif data == "receive":
             await event.answer()
@@ -5131,15 +5108,15 @@ async def callback_handler(event):
                         [Button.inline(t(user_id, "btn_back"), b"receive")]
                     ])
             except Exception as error:
-                await event.edit(f"❌ {error}", buttons=[[Button.inline(t(user_id, "btn_back"), b"receive")]])
+                await event.edit(t(user_id, "err_bare", error=error), buttons=[[Button.inline(t(user_id, "btn_back"), b"receive")]])
 
         elif data == "receive_onchain":
             await event.answer()
             try:
-                msg = await event.edit("⏳ Generating onchain address...")
+                msg = await event.edit(t(user_id, "generating_addr"))
 
                 btc_address, receive_fee = await create_onchain_address(user_id)
-                fee_display = await format_amount_with_usd(receive_fee)
+                fee_display = await format_amount_with_usd(receive_fee, user_id)
 
                 # Generate QR code for Bitcoin address
                 qr_buffer = generate_qr_code(f"bitcoin:{btc_address}")
@@ -5168,7 +5145,7 @@ async def callback_handler(event):
                 )
             except Exception as error:
                 await event.edit(
-                    f"❌ {error}",
+                    t(user_id, "err_bare", error=error),
                     buttons=[[Button.inline(t(user_id, "btn_back"), b"receive")]]
                 )
 
@@ -5191,7 +5168,7 @@ async def callback_handler(event):
                 )
             except Exception as e:
                 logging.error(f"receive_exchange error: {e}")
-                await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"receive")]])
+                await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_back"), b"receive")]])
 
         elif data.startswith("rcv_coin_"):
             await event.answer()
@@ -5199,7 +5176,7 @@ async def callback_handler(event):
             ud = user_data.get(user_id, {})
             currencies = ud.get('ffio_currencies') or await ffio_get_currencies()
             if not currencies:
-                await event.edit("Failed to load currencies.", buttons=[[Button.inline(t(user_id, "btn_back"), b"receive")]])
+                await event.edit(t(user_id, "ccy_load_fail"), buttons=[[Button.inline(t(user_id, "btn_back"), b"receive")]])
                 return
             grouped = ffio_group_currencies_by_coin(currencies, 'recv')
             networks = grouped.get(coin, [])
@@ -5214,8 +5191,7 @@ async def callback_handler(event):
                 user_data[user_id] = ud
                 # Show rate type selection
                 await event.edit(
-                    f"**{ccy['name']} -> Lightning BTC**\n\n"
-                    f"⚖️ Select rate type:",
+                    t(user_id, "ff_recv_rate_type", name=ccy['name']),
                     buttons=[
                         [Button.inline(t(user_id, "btn_rate_fixed"), b"rcv_fixed")],
                         [Button.inline(t(user_id, "btn_rate_float"), b"rcv_float")],
@@ -5227,9 +5203,9 @@ async def callback_handler(event):
                 for ccy in networks:
                     buttons.append([Button.inline(f"{ccy['name']}", f"rcv_net_{ccy['code']}".encode())])
                 buttons.append([Button.inline(t(user_id, "btn_back"), b"receive_exchange")])
-                await event.edit(f"🌐 **Select Network for {coin}:**", buttons=buttons)
+                await event.edit(t(user_id, "ff_select_net", coin=coin), buttons=buttons)
             else:
-                await event.edit(f"{coin} is not available.", buttons=[[Button.inline(t(user_id, "btn_back"), b"receive_exchange")]])
+                await event.edit(t(user_id, "ff_coin_unavailable", coin=coin), buttons=[[Button.inline(t(user_id, "btn_back"), b"receive_exchange")]])
 
         elif data.startswith("rcv_net_"):
             await event.answer()
@@ -5240,7 +5216,7 @@ async def callback_handler(event):
             ccy_info = next((c for c in (currencies or []) if c['code'] == ccy_code), None)
             if not ccy_info:
                 logging.warning(f"ff.io: Currency code {ccy_code} not found in currencies list")
-                await event.edit("Currency not found.", buttons=[[Button.inline(t(user_id, "btn_back"), b"receive_exchange")]])
+                await event.edit(t(user_id, "ff_ccy_not_found"), buttons=[[Button.inline(t(user_id, "btn_back"), b"receive_exchange")]])
                 return
             logging.info(f"ff.io: Found currency info for {ccy_code}: {ccy_info.get('name')}")
             ud['ffio_from_ccy'] = ccy_code
@@ -5249,8 +5225,7 @@ async def callback_handler(event):
             ud['ffio_direction'] = 'receive'
             user_data[user_id] = ud
             await event.edit(
-                f"**{ccy_info['name']} -> Lightning BTC**\n\n"
-                f"⚖️ Select rate type:",
+                t(user_id, "ff_recv_rate_type", name=ccy_info['name']),
                 buttons=[
                     [Button.inline(t(user_id, "btn_rate_fixed"), b"rcv_fixed")],
                     [Button.inline(t(user_id, "btn_rate_float"), b"rcv_float")],
@@ -5279,15 +5254,13 @@ async def callback_handler(event):
                     min_val = fr.get('min', '')
                     max_val = fr.get('max', '')
                     if min_val or max_val:
-                        minmax_text = f"\nMin: **{min_val}** | Max: **{max_val}**\n"
+                        minmax_text = t(user_id, "ff_minmax_pair", mn=min_val, mx=max_val)
             except:
                 pass
 
             await event.edit(
-                f"**{from_name} -> Lightning BTC** [{rate_label}]\n"
-                f"{minmax_text}\n"
-                f"💰 Enter the amount to exchange:\n"
-                f"Example: `0.1` or `100`",
+                t(user_id, "ff_amount_prompt", name=from_name, rate=rate_label,
+                  minmax=minmax_text),
                 buttons=[[Button.inline(t(user_id, "btn_back"), b"receive_exchange")]]
             )
 
@@ -5295,7 +5268,7 @@ async def callback_handler(event):
             # Double-click prevention for ff.io order creation
             ud = user_data.get(user_id, {})
             if ud.get('ffio_order_creating'):
-                await event.answer("⏳ Order creation in progress...")
+                await event.answer(t(user_id, "order_creating"))
                 return
 
             await event.answer()
@@ -5304,7 +5277,7 @@ async def callback_handler(event):
                 ud['ffio_order_creating'] = True
                 user_data[user_id] = ud
 
-                await event.edit("⏳ Creating exchange order...")
+                await event.edit(t(user_id, "creating_order"))
                 from_ccy = ud.get('ffio_from_ccy')
                 amount = ud.get('ffio_amount')
 
@@ -5376,18 +5349,13 @@ async def callback_handler(event):
                         event.chat_id,
                         qr_buffer,
                         force_document=False,
-                        caption=(
-                            f"🔄 **Exchange Order Created!**\n\n"
-                            f"🆔 Order: `{order_id}`\n"
-                            f"📤 Send: **{deposit_amount} {from_name}**\n"
-                            f"📥 Receive: **~{receive_amount} BTC** (Lightning)\n\n"
-                            f"📋 **Deposit Address:**\n`{deposit_address}`\n"
-                            + (f"🏷 **Memo/Tag:** `{deposit_tag}`\n" if deposit_tag else "")
-                            + f"\n⏰ Expires in: {expiry_text}\n\n"
-                            f"⚠️ Send **exactly** {deposit_amount} {from_name} to the address above."
-                            + (f"\n⚠️ **Don't forget to include the Memo/Tag!**" if deposit_tag else "")
-                            + f"\n✅ Your Lightning wallet will be credited automatically!"
-                        ),
+                        caption=t(
+                            user_id, "ff_order_created_recv", oid=order_id,
+                            amount=deposit_amount, ccy=from_name, btc=receive_amount,
+                            addr=deposit_address,
+                            tag=(t(user_id, "ff_tag_line", tag=deposit_tag) if deposit_tag else ""),
+                            expiry=expiry_text,
+                            tagwarn=(t(user_id, "ff_tag_warn") if deposit_tag else "")),
                         buttons=[
                             [Button.inline(t(user_id, "btn_check_status"), f"ffio_st_{order_id}".encode())],
                         ]
@@ -5395,7 +5363,7 @@ async def callback_handler(event):
                 else:
                     error_msg = result.get('msg', 'Unknown error') if result else 'API error'
                     await event.edit(
-                        f"❌ **Exchange Error:**\n{error_msg}",
+                        t(user_id, "ff_exchange_err", error=error_msg),
                         buttons=[[Button.inline(t(user_id, "btn_try_again"), b"receive_exchange")], [Button.inline(t(user_id, "btn_back"), b"receive")]]
                     )
 
@@ -5404,14 +5372,14 @@ async def callback_handler(event):
 
             except Exception as e:
                 logging.error(f"Error creating ff.io receive order: {e}")
-                await event.edit(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"receive")]])
+                await event.edit(t(user_id, "err_alert_line", error=e), buttons=[[Button.inline(t(user_id, "btn_back"), b"receive")]])
 
         # ==================== SEND EXCHANGE (ff.io) ====================
         elif data == "send_exchange":
             await event.answer()
             try:
                 balance = await get_balance(user_id)
-                balance_display = await format_balance_with_usd(balance)
+                balance_display = await format_balance_with_usd(balance, user_id)
                 await event.edit(t(user_id, 'ff_loading'))
                 currencies = await ffio_get_currencies()
                 if not currencies:
@@ -5427,7 +5395,7 @@ async def callback_handler(event):
                 )
             except Exception as e:
                 logging.error(f"send_exchange error: {e}")
-                await event.edit(f"Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"send")]])
+                await event.edit(t(user_id, "alert_error", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_back"), b"send")]])
 
         elif data.startswith("snd_coin_"):
             await event.answer()
@@ -5435,7 +5403,7 @@ async def callback_handler(event):
             ud = user_data.get(user_id, {})
             currencies = ud.get('ffio_currencies') or await ffio_get_currencies()
             if not currencies:
-                await event.edit("Failed to load currencies.", buttons=[[Button.inline(t(user_id, "btn_back"), b"send")]])
+                await event.edit(t(user_id, "ff_ccy_load_fail"), buttons=[[Button.inline(t(user_id, "btn_back"), b"send")]])
                 return
             grouped = ffio_group_currencies_by_coin(currencies, 'send')
             networks = grouped.get(coin, [])
@@ -5447,8 +5415,7 @@ async def callback_handler(event):
                 ud['ffio_direction'] = 'send'
                 user_data[user_id] = ud
                 await event.edit(
-                    f"**Lightning BTC -> {ccy['name']}**\n\n"
-                    f"⚖️ Select rate type:",
+                    t(user_id, "ff_send_rate_type", name=ccy['name']),
                     buttons=[
                         [Button.inline(t(user_id, "btn_rate_fixed"), b"snd_fixed")],
                         [Button.inline(t(user_id, "btn_rate_float"), b"snd_float")],
@@ -5460,9 +5427,9 @@ async def callback_handler(event):
                 for ccy in networks:
                     buttons.append([Button.inline(f"{ccy['name']}", f"snd_net_{ccy['code']}".encode())])
                 buttons.append([Button.inline(t(user_id, "btn_back"), b"send_exchange")])
-                await event.edit(f"🌐 **Select Network for {coin}:**", buttons=buttons)
+                await event.edit(t(user_id, "ff_select_net", coin=coin), buttons=buttons)
             else:
-                await event.edit(f"{coin} is not available for sending.", buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
+                await event.edit(t(user_id, "ff_coin_unavailable_send", coin=coin), buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
 
         elif data.startswith("snd_net_"):
             await event.answer()
@@ -5471,7 +5438,7 @@ async def callback_handler(event):
             currencies = ud.get('ffio_currencies') or await ffio_get_currencies()
             ccy_info = next((c for c in (currencies or []) if c['code'] == ccy_code), None)
             if not ccy_info:
-                await event.edit("Currency not found.", buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
+                await event.edit(t(user_id, "ff_ccy_not_found"), buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
                 return
             ud['ffio_to_ccy'] = ccy_code
             ud['ffio_to_name'] = ccy_info['name']
@@ -5479,8 +5446,7 @@ async def callback_handler(event):
             ud['ffio_direction'] = 'send'
             user_data[user_id] = ud
             await event.edit(
-                f"**Lightning BTC -> {ccy_info['name']}**\n\n"
-                f"⚖️ Select rate type:",
+                t(user_id, "ff_send_rate_type", name=ccy_info['name']),
                 buttons=[
                     [Button.inline(t(user_id, "btn_rate_fixed"), b"snd_fixed")],
                     [Button.inline(t(user_id, "btn_rate_float"), b"snd_float")],
@@ -5513,17 +5479,18 @@ async def callback_handler(event):
                         try:
                             min_sats = int(float(min_val) * SATS_PER_BTC) if min_val else ''
                             max_sats = int(float(max_val) * SATS_PER_BTC) if max_val else ''
-                            minmax_text = f"\nMin: **{min_sats:,} sats** | Max: **{max_sats:,} sats**"
+                            minmax_text = t(user_id, "ff_sats_minmax_pre",
+                                            mn=f"{min_sats:,}", mx=f"{max_sats:,}")
                             ud['ffio_min_sats'] = min_sats
                             ud['ffio_max_sats'] = max_sats
                         except:
-                            minmax_text = f"\nMin: **{min_val} BTC** | Max: **{max_val} BTC**"
+                            minmax_text = t(user_id, "ff_btc_minmax_pre", mn=min_val, mx=max_val)
             except:
                 pass
 
             await event.edit(
-                f"**Lightning BTC -> {to_name}** [{rate_label}]{minmax_text}\n\n"
-                f"📋 Enter your wallet address:{tag_note}",
+                t(user_id, "ff_send_addr_prompt", name=to_name, rate=rate_label,
+                  minmax=minmax_text, tag=tag_note),
                 buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]]
             )
 
@@ -5534,21 +5501,18 @@ async def callback_handler(event):
             to_name = ud.get('ffio_to_name', ud.get('ffio_to_ccy', '?'))
             address = ud.get('ffio_to_address', '?')
             balance = await get_balance(user_id)
-            balance_display = await format_balance_with_usd(balance)
+            balance_display = await format_balance_with_usd(balance, user_id)
 
             min_sats = ud.get('ffio_min_sats', '')
             max_sats = ud.get('ffio_max_sats', '')
             limit_text = ""
             if min_sats or max_sats:
-                limit_text = f"Min: **{min_sats:,} sats** | Max: **{max_sats:,} sats**\n"
+                limit_text = t(user_id, "ff_sats_limit_line",
+                               mn=f"{min_sats:,}", mx=f"{max_sats:,}")
 
             await event.edit(
-                f"**Exchange Lightning BTC -> {to_name}**\n\n"
-                f"Balance: {balance_display}\n"
-                f"Address: `{address[:30]}...`\n"
-                f"{limit_text}\n"
-                f"💰 Enter amount in **sats** to exchange:\n"
-                f"Example: `50000` or `$10`",
+                t(user_id, "ff_amount_prompt_send", name=to_name, balance=balance_display,
+                  addr=f"{address[:30]}...", limits=limit_text),
                 buttons=[
                     [Button.inline(t(user_id, "btn_send_all"), b"ffio_send_all")],
                     [Button.inline(t(user_id, "btn_cancel"), b"send_exchange")]
@@ -5558,7 +5522,7 @@ async def callback_handler(event):
         elif data.startswith("snd_ex_confirm_") and not data.startswith("snd_ex_confirm_n"):
             await event.answer()
             try:
-                await event.edit("⏳ Creating exchange order...")
+                await event.edit(t(user_id, "creating_order"))
                 ud = user_data.get(user_id, {})
                 to_ccy = ud.get('ffio_to_ccy')
                 to_address = ud.get('ffio_to_address')
@@ -5586,9 +5550,8 @@ async def callback_handler(event):
                     min_sats = ud.get('ffio_min_sats')
                     if min_sats and amount_sats < min_sats:
                         await event.edit(
-                            f"❌ Amount after fee reserve is below minimum.\n\n"
-                            f"💰 After fee: **{amount_sats:,} sats**\n"
-                            f"📉 Minimum: **{min_sats:,} sats**",
+                            t(user_id, "ff_below_min_after_reserve",
+                              amount=f"{amount_sats:,}", min=f"{min_sats:,}"),
                             buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]]
                         )
                         return
@@ -5620,8 +5583,8 @@ async def callback_handler(event):
                         invoice = deposit_address
                         prepare_response, fee_sats, spark_fee = await prepare_payment(user_id, invoice, None)
 
-                        fee_display = await format_amount_with_usd(fee_sats or 0)
-                        amount_display = await format_amount_with_usd(amount_sats)
+                        fee_display = await format_amount_with_usd(fee_sats or 0, user_id)
+                        amount_display = await format_amount_with_usd(amount_sats, user_id)
 
                         pending_ffio_orders[user_id] = {
                             'id': order_id,
@@ -5637,15 +5600,12 @@ async def callback_handler(event):
 
                         fee_note = ""
                         if is_send_all:
-                            fee_note = "\n⚠️ Fee deducted from balance (Send All)"
+                            fee_note = t(user_id, "ff_fee_note_sendall")
 
                         await event.edit(
-                            f"🔄 **Exchange Order Created!**\n\n"
-                            f"🆔 Order: `{order_id}`\n"
-                            f"📤 Send: **{deposit_amount} BTC** (Lightning)\n"
-                            f"📥 Receive: **~{receive_amount} {to_ccy}**\n"
-                            f"💸 Network Fee: {fee_display}{fee_note}\n\n"
-                            f"⚡ Confirm to send Lightning payment to ff.io?",
+                            t(user_id, "ff_order_created_send", oid=order_id,
+                              amount=deposit_amount, recv=receive_amount, ccy=to_ccy,
+                              fee=fee_display, fee_note=fee_note),
                             buttons=[
                                 [Button.inline(t(user_id, "btn_confirm_send"), f"ffio_pay_{order_id}".encode())],
                                 [Button.inline(t(user_id, "btn_cancel_x"), b"back_to_menu")]
@@ -5653,13 +5613,13 @@ async def callback_handler(event):
                         )
                     except Exception as e:
                         await event.edit(
-                            f"❌ **Payment Error:**\n{e}",
+                            t(user_id, "ff_payment_err", error=str(e)),
                             buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]]
                         )
                 else:
                     error_msg = result.get('msg', 'Unknown error') if result else 'API error'
                     await event.edit(
-                        f"❌ **Exchange Error:**\n{error_msg}",
+                        t(user_id, "ff_exchange_err", error=error_msg),
                         buttons=[[Button.inline(t(user_id, "btn_try_again"), b"send_exchange")], [Button.inline(t(user_id, "btn_back"), b"send")]]
                     )
 
@@ -5668,7 +5628,7 @@ async def callback_handler(event):
 
             except Exception as e:
                 logging.error(f"Error creating ff.io send order: {e}")
-                await event.edit(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"send")]])
+                await event.edit(t(user_id, "err_alert_line", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_back"), b"send")]])
 
         elif data == "ffio_send_all":
             await event.answer()
@@ -5682,14 +5642,12 @@ async def callback_handler(event):
             else:
                 amount_sats = balance
             if amount_sats <= 0:
-                await event.edit("❌ No balance to send.", buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
+                await event.edit(t(user_id, "ff_no_balance"), buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
                 return
             min_sats = ud.get('ffio_min_sats')
             if min_sats and amount_sats < min_sats:
                 await event.edit(
-                    f"❌ Balance too low for minimum.\n\n"
-                    f"Minimum: **{min_sats:,} sats**\n"
-                    f"Your balance: **{balance:,} sats**",
+                    t(user_id, "ff_balance_too_low", min=f"{min_sats:,}", balance=f"{balance:,}"),
                     buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]]
                 )
                 return
@@ -5702,14 +5660,10 @@ async def callback_handler(event):
                 if price_result and price_result.get('code') == 0 and price_result.get('data'):
                     receive_amount = price_result['data'].get('to', {}).get('amount', '?')
                     rate = price_result['data'].get('to', {}).get('rate', '?')
-                    amount_display = await format_amount_with_usd(amount_sats)
+                    amount_display = await format_amount_with_usd(amount_sats, user_id)
                     await event.edit(
-                        f"🔄 **Exchange Quote (Send All)**\n\n"
-                        f"📤 Send: **{amount_display}**\n"
-                        f"📥 Receive: **~{receive_amount} {to_ccy}**\n"
-                        f"📊 Rate: {rate}\n\n"
-                        f"⚠️ Network fee will be deducted from send amount (like normal withdrawal).\n"
-                        f"Proceed?",
+                        t(user_id, "ff_quote_sendall", send=amount_display,
+                          recv=receive_amount, ccy=to_ccy, rate=rate),
                         buttons=[
                             [Button.inline(t(user_id, "btn_create_order"), b"snd_ex_confirm_yes")],
                             [Button.inline(t(user_id, "btn_cancel_x"), b"send_exchange")]
@@ -5717,16 +5671,16 @@ async def callback_handler(event):
                     )
                 else:
                     error_msg = price_result.get('msg', 'Unknown error') if price_result else 'API error'
-                    await event.edit(f"❌ Quote Error: {error_msg}", buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
+                    await event.edit(t(user_id, "ff_quote_err", error=error_msg), buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
             except Exception as e:
-                await event.edit(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
+                await event.edit(t(user_id, "err_alert_line", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
 
         elif data.startswith("ffio_pay_"):
             # Double-click prevention for ff.io payment
             async with user_lock(user_id):
                 order_info = pending_ffio_orders.get(user_id)
                 if order_info and order_info.get('payment_processing'):
-                    await event.answer("⏳ Payment already in progress...")
+                    await event.answer(t(user_id, "pay_in_progress"))
                     return
 
                 order_id = data[9:]  # after "ffio_pay_"
@@ -5739,10 +5693,9 @@ async def callback_handler(event):
                         user_data[user_id] = {}
                     user_data[user_id]['pending_ffio_order_id'] = order_id
                     hint = get_password_hint(user_id)
-                    hint_text = f"\n\n💡 Hint: {hint}" if hint else ""
+                    hint_text = t(user_id, "pw_hint_hint", hint=hint) if hint else ""
                     await event.edit(
-                        f"🔒 **Password Required**\n\n"
-                        f"Enter your send password to confirm this payment:{hint_text}",
+                        t(user_id, "pw_required_pay", hint=hint_text),
                         buttons=[[Button.inline(t(user_id, "btn_cancel_x"), b"send_exchange")]]
                     )
                     # Store message ID for later editing
@@ -5752,17 +5705,17 @@ async def callback_handler(event):
                 await event.answer()
                 try:
                     if not order_info or order_info['id'] != order_id:
-                        await event.edit("❌ Order not found.", buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
+                        await event.edit(t(user_id, "ff_order_not_found"), buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
                         return
 
                     # Mark as processing to prevent double-clicks
                     order_info['payment_processing'] = True
 
-                    await event.edit("⏳ Sending Lightning payment to ff.io...")
+                    await event.edit(t(user_id, "ff_sending_ln"))
 
                     prepare_response = order_info.get('prepare_response')
                     if not prepare_response:
-                        await event.edit("❌ Payment session expired.", buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
+                        await event.edit(t(user_id, "ff_session_expired_pay"), buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
                         return
 
                     options = SendPaymentOptions.BOLT11_INVOICE(prefer_spark=True, completion_timeout_secs=PAYMENT_COMPLETION_TIMEOUT_SECS)
@@ -5775,14 +5728,14 @@ async def callback_handler(event):
                         if is_success:
                             to_ccy = order_info.get('to_ccy', '?')
                             await event.edit(
-                                _ffio_success_text(order_id, to_ccy),
+                                _ffio_success_text(order_id, to_ccy, user_id=user_id),
                                 buttons=_ffio_success_buttons(user_id, order_id)
                             )
                             await show_tip_prompt(user_id)
                         else:
                             if failure_reason == 'failed':
                                 await event.edit(
-                                    t(user_id, 'payment_failed') + f"\n\n🆔 Order: `{order_id}`",
+                                    t(user_id, 'payment_failed') + t(user_id, "order_line", oid=order_id),
                                     buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                                 )
                             else:
@@ -5793,7 +5746,7 @@ async def callback_handler(event):
                                     user_id=user_id, chat_id=event.chat_id,
                                     message_id=event.message_id,
                                     payment_id=getattr(payment, 'id', None),
-                                    success_text=_ffio_success_text(order_id, order_info.get('to_ccy', '?')),
+                                    success_text=_ffio_success_text(order_id, order_info.get('to_ccy', '?'), user_id=user_id),
                                     success_buttons=_ffio_success_buttons(user_id, order_id),
                                     order_info=order_info)
                     else:
@@ -5805,11 +5758,25 @@ async def callback_handler(event):
                             message_id=event.message_id, payment_id=None,
                             success_text='', order_info=order_info)
                 except Exception as e:
-                    logging.error(f"Error paying ff.io order: {e}")
-                    await event.edit(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
+                    if _duplicate_payment_error(e):
+                        # Conclusive duplicate (2026-11 incident): the network
+                        # rejected the request outright — nothing new was sent.
+                        # Reopen this order's pay button instead of wedging it.
+                        if order_info:
+                            order_info['payment_processing'] = False
+                        logging.info(
+                            'duplicate invoice rejected (already-paid payment hash) uid=%s',
+                            user_id)
+                        await event.edit(
+                            t(user_id, 'payment_duplicate_invoice'),
+                            buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
+                        )
+                    else:
+                        logging.error(f"Error paying ff.io order: {e}")
+                        await event.edit(t(user_id, "err_alert_line", error=e), buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
 
         elif data.startswith("ffio_st_"):
-            await event.answer("Checking order status...")
+            await event.answer(t(user_id, "ff_status_checking"))
             try:
                 order_id = data[8:]  # after "ffio_st_"
                 # Get token from tracked orders
@@ -5848,27 +5815,25 @@ async def callback_handler(event):
                     to_amt = fmt_amount(to_info.get('amount'))
 
                     text = (
-                        f"🔍 **Order Status**\n\n"
-                        f"🆔 Order: `{order_id}`\n"
-                        f"{icon} Status: **{status}**\n\n"
-                        f"📤 From: {from_amt} {from_name}\n"
-                        f"📥 To: {to_amt} {to_name}\n"
+                        t(user_id, "ff_status_card", oid=order_id, icon=icon, status=status)
+                        + t(user_id, "ff_status_from", amt=from_amt, ccy=from_name) + "\n"
+                        + t(user_id, "ff_status_to", amt=to_amt, ccy=to_name) + "\n"
                     )
 
                     # Time info
                     time_info = order.get('time', {})
                     left = time_info.get('left')
                     if left and int(left) > 0:
-                        text += f"\n⏰ Time left: {int(left)//60}m {int(left)%60}s\n"
+                        text += t(user_id, "ff_status_time", m=int(left)//60, s=int(left)%60)
 
                     if from_info.get('tx', {}).get('id'):
                         tx_id = from_info['tx']['id']
-                        text += f"\n🔗 TX: `{tx_id}`"
+                        text += t(user_id, "ff_status_tx", tx=tx_id)
 
                     confs = from_info.get('tx', {}).get('confirmations')
                     req_confs = from_info.get('reqConfirmations')
                     if confs is not None and req_confs:
-                        text += f"\n🔢 Confirmations: {confs}/{req_confs}"
+                        text += t(user_id, "ff_status_confs", c=confs, req=req_confs)
 
                     buttons = []
                     if status not in ('DONE', 'EXPIRED'):
@@ -5882,22 +5847,19 @@ async def callback_handler(event):
                         try:
                             await event.edit(text, buttons=buttons if buttons else None)
                         except Exception:
-                            await event.answer("Status unchanged.", alert=False)
+                            await event.answer(t(user_id, "ff_status_unchanged"), alert=False)
                 else:
                     error_msg = result.get('msg', 'No data') if result else 'API error'
-                    await event.answer(f"Error: {error_msg}", alert=True)
+                    await event.answer(t(user_id, "alert_error", error=error_msg), alert=True)
             except Exception as e:
-                await event.answer(f"Error: {e}", alert=True)
+                await event.answer(t(user_id, "alert_error", error=str(e)), alert=True)
 
         elif data == "receive_add_memo":
             await event.answer()
             # remember existing invoice state so Set Memo can come back to it
             user_data[user_id] = user_data.get(user_id) or {}
             user_steps[user_id] = "receive_memo"
-            msg_content = (
-                "💬 **Add Memo**\n\n"
-                "Enter a description/memo for your invoice:"
-            )
+            msg_content = t(user_id, "memo_prompt")
             msg_buttons = [[Button.inline(t(user_id, "btn_cancel"), b"receive_lightning")]]
             # Get the message to check if it has media
             msg = await event.get_message()
@@ -5942,7 +5904,7 @@ async def callback_handler(event):
                     ]
                 )
             except Exception as error:
-                await event.edit(f"❌ Error: {error}")
+                await event.edit(t(user_id, "err_alert_line", error=str(error)))
 
         elif data == "receive_set_amount":
             await event.answer()
@@ -5953,13 +5915,10 @@ async def callback_handler(event):
             hint = ""
             if usd_rate:
                 sats_per_dollar = usd_to_sats(1, usd_rate)
-                hint = f"\n\n💡 Tip: $1 = {sats_per_dollar:,} sats, $5 = {usd_to_sats(5, usd_rate):,} sats"
+                hint = t(user_id, "usd_hint", one=f"{sats_per_dollar:,}",
+                         five=f"{usd_to_sats(5, usd_rate):,}")
 
-            msg_content = (
-                f"💵 **Set Invoice Amount**\n\n"
-                f"Enter the amount in sats:\n"
-                f"Or use $ prefix for USD (e.g., $5){hint}"
-            )
+            msg_content = t(user_id, "set_amount_prompt", hint=hint)
             msg_buttons = [[Button.inline(t(user_id, "btn_cancel"), b"receive_lightning")]]
             # Get the message to check if it has media
             msg = await event.get_message()
@@ -5986,13 +5945,9 @@ async def callback_handler(event):
             hint = ""
             if usd_rate:
                 sats_per_dollar = usd_to_sats(1, usd_rate)
-                hint = f"\n\n💡 Tip: $1 = {sats_per_dollar:,} sats"
+                hint = t(user_id, "usd_hint_short", one=f"{sats_per_dollar:,}")
 
-            msg_content = (
-                f"💵 **Set Invoice Amount**\n\n"
-                f"Enter the amount in sats:\n"
-                f"Or use $ prefix for USD (e.g., $5){hint}"
-            )
+            msg_content = t(user_id, "set_amount_prompt", hint=hint)
             msg_buttons = [[Button.inline(t(user_id, "btn_cancel"), b"receive_lightning")]]
             # Get the message to check if it has media
             msg = await event.get_message()
@@ -6065,34 +6020,36 @@ async def callback_handler(event):
             fee = user_data[user_id].get('fee', 0)
             total = amount + fee if amount else fee
 
-            amount_usd = await format_amount_with_usd(amount) if amount else 'Variable'
-            fee_usd = await format_amount_with_usd(fee)
-            total_usd = await format_amount_with_usd(total)
+            amount_usd = await format_amount_with_usd(amount, user_id) if amount else 'Variable'
+            fee_usd = await format_amount_with_usd(fee, user_id)
+            total_usd = await format_amount_with_usd(total, user_id)
 
             # Show bot status
             bot_status = "✅" if has_started else "⚠️"
-            recipient_text = f"👤 To: @{ru['username']} ({_md_escape(str(ru['display_name']))}) {bot_status}\n\n"
+            recipient_text = t(user_id, "pay_to_line", username=ru['username'],
+                                name=_md_escape(str(ru['display_name'])),
+                                status=bot_status)
 
             is_anonymous = user_data[user_id].get('send_anonymous', False)
             if is_anonymous:
-                anon_text = "👻 Sender: **Anonymous**"
+                anon_text = t(user_id, "pay_sender_anon")
                 anon_btn = Button.inline(t(user_id, "btn_show_name"), b"toggle_send_anon")
             else:
-                anon_text = "👤 Sender: **Visible**"
+                anon_text = t(user_id, "pay_sender_visible")
                 anon_btn = Button.inline(t(user_id, "btn_anon"), b"toggle_send_anon")
 
             recipient_text += f"{anon_text}\n\n"
 
             if ru['is_channel'] or ru['is_group']:
-                recipient_tips = "\n\n⚠️ _Group/Channel wallet - notify admin!_"
+                recipient_tips = t(user_id, "pay_tip_group")
             elif not has_started:
-                recipient_tips = "\n\n⚠️ _Recipient hasn't started bot - won't be notified!_"
+                recipient_tips = t(user_id, "pay_tip_notstarted")
             else:
                 recipient_tips = ""
 
             password_hint = ""
             if not has_send_password(user_id):
-                password_hint = "\n💡 _Set a send password in Settings for security_"
+                password_hint = t(user_id, "pay_pw_hint")
 
             buttons = [
                 [anon_btn],
@@ -6103,14 +6060,12 @@ async def callback_handler(event):
             ]
 
             _q = (user_data.get(user_id) or {}).get('send_queue') or []
-            _q_txt = (build_queue_text(_q)[0] + "\n\n" + "─" * 10 + "\n🔹 **New payment:**\n") if _q else ""
+            _q_txt = (build_queue_text(_q, user_id)[0] + "\n\n" + "─" * 10 + "\n" + t(user_id, "queue_new_payment") + "\n") if _q else ""
             await event.edit(
-                _q_txt + f"📋 **Payment Summary**\n\n"
-                f"{recipient_text}"
-                f"💰 Amount: {amount_usd}\n"
-                f"⚡ Fee: {fee_usd}\n"
-                f"💳 Total: {total_usd}\n\n"
-                f"Confirm payment?{recipient_tips}{password_hint}",
+                _q_txt + t(user_id, "pay_summary",
+                           recipient=recipient_text, amount=amount_usd,
+                           fee=fee_usd, total=total_usd,
+                           tips=recipient_tips, hint=password_hint),
                 buttons=buttons
             )
             return
@@ -6138,20 +6093,22 @@ async def callback_handler(event):
             total = amount + fee if amount else fee
             original_balance = user_data[user_id].get('original_balance', total)
 
-            balance_display = await format_balance_with_usd(original_balance)
-            fee_display = await format_amount_with_usd(fee)
-            amount_display = await format_amount_with_usd(amount)
-            total_display = await format_amount_with_usd(total)
+            balance_display = await format_balance_with_usd(original_balance, user_id)
+            fee_display = await format_amount_with_usd(fee, user_id)
+            amount_display = await format_amount_with_usd(amount, user_id)
+            total_display = await format_amount_with_usd(total, user_id)
 
             bot_status = "✅" if has_started else "⚠️"
-            recipient_text = f"👤 To: @{ru['username']} ({_md_escape(str(ru['display_name']))}) {bot_status}\n\n"
+            recipient_text = t(user_id, "pay_to_line", username=ru['username'],
+                                name=_md_escape(str(ru['display_name'])),
+                                status=bot_status)
 
             is_anonymous = user_data[user_id].get('send_anonymous', False)
             if is_anonymous:
-                anon_text = "👻 Sender: **Anonymous**"
+                anon_text = t(user_id, "pay_sender_anon")
                 anon_btn = Button.inline(t(user_id, "btn_show_name"), b"toggle_send_anon_all")
             else:
-                anon_text = "👤 Sender: **Visible**"
+                anon_text = t(user_id, "pay_sender_visible")
                 anon_btn = Button.inline(t(user_id, "btn_anon"), b"toggle_send_anon_all")
 
             recipient_text += f"{anon_text}\n\n"
@@ -6165,14 +6122,9 @@ async def callback_handler(event):
             ]
 
             await event.edit(
-                f"⚡ **Send All - Lightning**\n\n"
-                f"{recipient_text}"
-                f"💰 Balance: {balance_display}\n"
-                f"⚡ Fee: {fee_display}\n"
-                f"💸 Amount to send: {amount_display}\n"
-                f"💳 Total: {total_display}\n\n"
-                f"⚠️ Fee will be deducted from your balance\n\n"
-                f"Confirm?",
+                t(user_id, "pay_summary_sendall",
+                  recipient=recipient_text, balance=balance_display,
+                  fee=fee_display, amount=amount_display, total=total_display),
                 buttons=buttons
             )
             return
@@ -6243,12 +6195,9 @@ async def callback_handler(event):
             if has_password:
                 # User already has password - show options
                 hint = get_password_hint(user_id)
-                hint_text = f"💡 Current Hint: {hint}" if hint else "💡 No hint set"
+                hint_text = t(user_id, "pw_current_hint", hint=hint) if hint else t(user_id, "pw_no_hint")
                 await event.edit(
-                    f"🔒 **Send Password**\n\n"
-                    f"You have a send password set.\n"
-                    f"{hint_text}\n\n"
-                    f"What would you like to do?",
+                    t(user_id, "pw_send_menu", hint_text=hint_text),
                     buttons=[
                         [Button.inline(t(user_id, "btn_chpass"), b"change_send_password")],
                         [Button.inline(t(user_id, "btn_hint"), b"set_password_hint")],
@@ -6261,10 +6210,7 @@ async def callback_handler(event):
                 # No password - prompt to set one
                 user_steps[user_id] = "set_send_password"
                 await event.edit(
-                    "🔒 **Set Send Password**\n\n"
-                    "Enter a password that will be required when sending payments.\n\n"
-                    "⚠️ This adds an extra layer of security.\n"
-                    "💡 Choose a password you can remember!",
+                    t(user_id, "pw_set_prompt"),
                     buttons=_row_cancel_settings(user_id)
                 )
                 # Store message ID for later editing
@@ -6278,8 +6224,7 @@ async def callback_handler(event):
             hint = get_password_hint(user_id)
             hint_text = f"\n\n💡 Hint: {hint}" if hint else ""
             await event.edit(
-                f"🔒 **Change Send Password**\n\n"
-                f"Enter your current password:{hint_text}",
+                t(user_id, "pw_change_prompt", hint=hint_text),
                 buttons=_row_cancel_settings(user_id)
             )
             # Store the prompt message ID for later editing
@@ -6293,8 +6238,7 @@ async def callback_handler(event):
             hint = get_password_hint(user_id)
             hint_text = f"\n\n💡 Hint: {hint}" if hint else ""
             await event.edit(
-                f"🔒 **Remove Send Password**\n\n"
-                f"Enter your current password to confirm removal:{hint_text}",
+                t(user_id, "pw_remove_prompt", hint=hint_text),
                 buttons=_row_cancel_settings(user_id)
             )
             # Store the prompt message ID for later editing
@@ -6306,15 +6250,9 @@ async def callback_handler(event):
             await event.answer()
             user_steps[user_id] = "set_password_hint"
             current_hint = get_password_hint(user_id)
-            current_text = f"\n\nCurrent hint: {current_hint}" if current_hint else ""
+            current_text = t(user_id, "pw_current_hint_line", hint=current_hint) if current_hint else ""
             await event.edit(
-                f"💡 **Set Password Hint**\n\n"
-                f"Enter a hint to help you remember your password.\n"
-                f"This hint will be shown when password is required.{current_text}\n\n"
-                f"Example hints:\n"
-                f"• \"My cat's name\"\n"
-                f"• \"Birthday + favorite number\"\n"
-                f"• \"First car model\"",
+                t(user_id, "pw_hint_prompt", current=current_text),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"set_send_password")]]
             )
 
@@ -6333,10 +6271,7 @@ async def callback_handler(event):
                     mins = (remaining.seconds % 3600) // 60
                     time_str = f"{days}d {hours}h {mins}m" if days > 0 else f"{hours}h {mins}m"
                     await event.edit(
-                        f"⏳ **Password Reset Pending**\n\n"
-                        f"You already requested a password reset.\n\n"
-                        f"⏱ Time remaining: **{time_str}**\n\n"
-                        f"Your password will be automatically removed when the timer ends.",
+                        t(user_id, "pw_reset_pending", time=time_str),
                         buttons=[
                             [Button.inline(t(user_id, "btn_cancel_reset"), b"cancel_password_reset")],
                             [Button.inline(t(user_id, "btn_back_settings"), b"settings_back")]
@@ -6348,22 +6283,14 @@ async def callback_handler(event):
                     remove_send_password(user_id)
                     cancel_password_reset(user_id)
                     await event.edit(
-                        "🔓 **Password Reset Complete**\n\n"
-                        "Your send password has been removed.\n\n"
-                        "You can set a new password in Settings.",
+                        t(user_id, "pw_reset_complete"),
                         buttons=[[Button.inline(t(user_id, "btn_settings"), b"settings")]]
                     )
                     return
 
-            hint_text = f"💡 Your hint: **{hint}**\n\n" if hint else ""
+            hint_text = t(user_id, "pw_your_hint", hint=hint) if hint else ""
             await event.edit(
-                f"🔒 **Forgot Password?**\n\n"
-                f"{hint_text}"
-                f"If you can't remember your password, you can request a reset.\n\n"
-                f"⚠️ **Important:**\n"
-                f"• Password will be removed after **{PASSWORD_RESET_DAYS} days**\n"
-                f"• You can cancel the reset anytime\n"
-                f"• This is for security to prevent unauthorized access",
+                t(user_id, "pw_forgot_card", hint_text=hint_text, days=PASSWORD_RESET_DAYS),
                 buttons=[
                     [Button.inline(t(user_id, "btn_try_again"), b"backup")],
                     [Button.inline(t(user_id, "btn_req_reset"), b"request_password_reset")],
@@ -6376,10 +6303,7 @@ async def callback_handler(event):
             request_password_reset(user_id)
             reset_at = datetime.now() + timedelta(days=PASSWORD_RESET_DAYS)
             await event.edit(
-                f"✅ **Reset Requested**\n\n"
-                f"Your password will be automatically removed on:\n"
-                f"📅 **{reset_at.strftime('%Y-%m-%d %H:%M')}**\n\n"
-                f"You can cancel this request anytime before the deadline.",
+                t(user_id, "pw_reset_requested", date=reset_at.strftime('%Y-%m-%d %H:%M')),
                 buttons=[
                     [Button.inline(t(user_id, "btn_cancel_reset"), b"cancel_password_reset")],
                     [Button.inline(t(user_id, "btn_back_settings"), b"settings_back")]
@@ -6390,9 +6314,7 @@ async def callback_handler(event):
             await event.answer()
             cancel_password_reset(user_id)
             await event.edit(
-                "✅ **Reset Cancelled**\n\n"
-                "Your password reset request has been cancelled.\n"
-                "Your password remains active.",
+                t(user_id, "pw_reset_cancelled"),
                 buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings_back")]]
             )
 
@@ -6401,12 +6323,7 @@ async def callback_handler(event):
             if user_id in user_steps:
                 del user_steps[user_id]
             await event.edit(
-                "✅ **Setup Complete!**\n\n"
-                "Your send password is now active.\n\n"
-                "You'll need this password to:\n"
-                "• Send payments\n"
-                "• View backup seeds\n\n"
-                "💡 You can add a hint later from Settings > Password > Set Hint",
+                t(user_id, "pw_setup_complete"),
                 buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings_back")]]
             )
 
@@ -6414,7 +6331,7 @@ async def callback_handler(event):
             # Quick tip amount from post-payment prompt
             amount = int(data.replace("tip_amount_", ""))
             DONATE_USER_ID = int(os.getenv('DONATE_USER_ID', '0'))
-            await event.answer("⚡ Sending tip...")
+            await event.answer(t(user_id, "tip_sending_toast"))
             try:
                 await init(DONATE_USER_ID)
                 donate_invoice = await create_invoice(DONATE_USER_ID, amount_sats=amount, description="Zap tip - thank you!")
@@ -6427,19 +6344,17 @@ async def callback_handler(event):
                     if user_id in user_data:
                         user_data[user_id]['just_donated'] = True
                     await event.edit(
-                        f"💝 **Tip sent — thank you!**\n\n"
-                        f"💰 {amount:,} sats\n\n"
-                        f"You're awesome! ⚡",
+                        t(user_id, "tip_sent_amount", amount=f"{amount:,} {t(user_id, 'sats_unit')}"),
                         buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                     )
                 else:
                     await event.edit(
-                        f"❌ Tip failed: {failure_reason}",
+                        t(user_id, "tip_failed_reason", reason=failure_reason),
                         buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                     )
             except Exception as error:
                 await event.edit(
-                    f"❌ Tip failed: {error}",
+                    t(user_id, "tip_failed_reason", reason=error),
                     buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                 )
 
@@ -6447,8 +6362,7 @@ async def callback_handler(event):
             await event.answer()
             user_steps[user_id] = "tip_custom_amount"
             await event.edit(
-                "💝 **Enter tip amount**\n\n"
-                "Sats (`5000`) or USD (`$1`) — your choice:",
+                t(user_id, "tip_enter_amount"),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"tip_dismiss")]]
             )
 
@@ -6476,13 +6390,10 @@ async def callback_handler(event):
             usd_rate = await get_usd_rate()
             usd_info = ""
             if usd_rate:
-                usd_info = (
-                    f"\n\n💵 In USD terms:\n"
-                    f"• 1,000 sats = ${sats_to_usd(1000, usd_rate):.2f}\n"
-                    f"• 5,000 sats = ${sats_to_usd(5000, usd_rate):.2f}\n"
-                    f"• 10,000 sats = ${sats_to_usd(10000, usd_rate):.2f}\n"
-                    f"• 21,000 sats = ${sats_to_usd(21000, usd_rate):.2f}"
-                )
+                usd_info = t(
+                    user_id, "donate_usd_info",
+                    a=f"{sats_to_usd(1000, usd_rate):.2f}", b=f"{sats_to_usd(5000, usd_rate):.2f}",
+                    c=f"{sats_to_usd(10000, usd_rate):.2f}", d=f"{sats_to_usd(21000, usd_rate):.2f}")
 
             msg = await event.edit(
                 t(user_id, 'donate_amount_title') + usd_info,
@@ -6496,11 +6407,7 @@ async def callback_handler(event):
             await event.answer()
             user_steps[user_id] = "scan_payment_input"
             msg = await event.edit(
-                "🔍 **Scan Payment**\n\n"
-                "Enter a payment ID to look up transaction details.\n\n"
-                "Payment IDs look like:\n"
-                "`019b492e...`\n\n"
-                "Paste the payment ID below:",
+                t(user_id, "scan_payment_prompt"),
                 buttons=_row_cancel_to_menu(user_id)
             )
             if user_id not in user_data:
@@ -6511,7 +6418,7 @@ async def callback_handler(event):
             # Double-click prevention: check if payment is already being processed
             async with user_lock(user_id):
                 if user_id in user_data and user_data[user_id].get('payment_processing'):
-                    await event.answer("⏳ Payment already in progress...")
+                    await event.answer(t(user_id, "pay_in_progress"))
                     return
 
                 if user_id in user_data and 'prepare_response' in user_data[user_id]:
@@ -6520,10 +6427,9 @@ async def callback_handler(event):
                         await event.answer()
                         user_steps[user_id] = "verify_send_password_for_payment"
                         hint = get_password_hint(user_id)
-                        hint_text = f"\n\n💡 Hint: {hint}" if hint else ""
+                        hint_text = t(user_id, "pw_hint_hint", hint=hint) if hint else ""
                         await event.edit(
-                            f"🔒 **Password Required**\n\n"
-                            f"Enter your send password to confirm this payment:{hint_text}",
+                            t(user_id, "pw_required_pay", hint=hint_text),
                             buttons=[[Button.inline(t(user_id, "btn_cancel_x"), b"back_to_menu")]]
                         )
                         # Store message ID for later editing
@@ -6535,7 +6441,7 @@ async def callback_handler(event):
                         # Mark payment as processing IMMEDIATELY to prevent double-clicks
                         user_data[user_id]['payment_processing'] = True
 
-                        await event.answer("⚡ Processing payment...")
+                        await event.answer(t(user_id, "processing_payment"))
                         prepare_response = user_data[user_id]['prepare_response']
                         payment_type = user_data[user_id].get('payment_type', 'bolt11')
                         fee = user_data[user_id].get('fee', 0)
@@ -6545,8 +6451,8 @@ async def callback_handler(event):
                             response = await lnurl_pay(user_id, prepare_response)
                             lnurl_payment = getattr(response, 'payment', None)
                             amount = user_data[user_id].get('amount', 'N/A')
-                            amount_display = await format_amount_with_usd(amount) if isinstance(amount, int) else amount
-                            fee_display = await format_amount_with_usd(fee)
+                            amount_display = await format_amount_with_usd(amount, user_id) if isinstance(amount, int) else amount
+                            fee_display = await format_amount_with_usd(fee, user_id)
                             is_success, failure_reason = is_payment_successful(lnurl_payment)
                             if not is_success:
                                 if failure_reason == 'failed':
@@ -6560,7 +6466,7 @@ async def callback_handler(event):
                                     user_id=user_id, chat_id=event.chat_id,
                                     message_id=event.message_id,
                                     payment_id=getattr(lnurl_payment, 'id', None),
-                                    success_text=_lnurl_success_text(amount_display, fee_display),
+                                    success_text=_lnurl_success_text(amount_display, fee_display, user_id=user_id),
                                     amount=amount if isinstance(amount, int) else None,
                                     fee=fee, prepare_response=prepare_response,
                                     manage_gate=True)
@@ -6570,7 +6476,7 @@ async def callback_handler(event):
                             if isinstance(amount, int) and amount > 0:
                                 track_volume('out', amount + fee)
 
-                            await event.edit(_lnurl_success_text(amount_display, fee_display))
+                            await event.edit(_lnurl_success_text(amount_display, fee_display, user_id=user_id))
                             await show_tip_prompt(user_id)
                         else:
                             options = user_data[user_id].get('options')
@@ -6589,7 +6495,7 @@ async def callback_handler(event):
                                     try:
                                         # Build sender info
                                         if is_anonymous:
-                                            sender_info = "👻 Anonymous"
+                                            sender_info = t(user_id, "anon_sender_label")
                                         else:
                                             sender = await client.get_entity(user_id)
                                             sender_name = f"@{sender.username}" if sender.username else sender.first_name
@@ -6611,8 +6517,8 @@ async def callback_handler(event):
 
                             payment_id = getattr(payment, 'id', 'N/A')
                             amount = getattr(payment, 'amount', user_data[user_id].get('amount', 'N/A'))
-                            amount_display = await format_amount_with_usd(amount) if isinstance(amount, int) else amount
-                            fee_display = await format_amount_with_usd(fee)
+                            amount_display = await format_amount_with_usd(amount, user_id) if isinstance(amount, int) else amount
+                            fee_display = await format_amount_with_usd(fee, user_id)
 
                             # Check if payment is truly successful
                             is_success, failure_reason = is_payment_successful(payment)
@@ -6630,7 +6536,7 @@ async def callback_handler(event):
                                 _spawn_payment_recheck(
                                     user_id=user_id, chat_id=event.chat_id,
                                     message_id=event.message_id, payment_id=payment_id,
-                                    success_text=_payment_success_text(amount_display, fee_display, payment_id),
+                                    success_text=_payment_success_text(amount_display, fee_display, payment_id, user_id=user_id),
                                     success_buttons=_payment_success_buttons(user_id, payment_id),
                                     amount=amount if isinstance(amount, int) else None,
                                     fee=fee, prepare_response=prepare_response,
@@ -6642,7 +6548,7 @@ async def callback_handler(event):
                                     track_volume('out', amount + fee)
 
                                 await event.edit(
-                                    _payment_success_text(amount_display, fee_display, payment_id),
+                                    _payment_success_text(amount_display, fee_display, payment_id, user_id=user_id),
                                     buttons=_payment_success_buttons(user_id, payment_id)
                                 )
                                 await show_tip_prompt(user_id)
@@ -6654,10 +6560,9 @@ async def callback_handler(event):
                                             del pending_sender_info[resolved_user['id']]
 
                                 await event.edit(
-                                    f"❌ **Payment Failed**\n\n"
-                                    f"💰 Amount: {amount_display}\n"
-                                    f"Reason: {failure_reason}\n"
-                                    f"🆔 ID: `{payment_id}`",
+                                    t(user_id, "pay_failed_detail",
+                                      amount=amount_display, reason=failure_reason,
+                                      pid=payment_id),
                                     buttons=[
                                         [Button.inline(t(user_id, "btn_pay_details"), f"track_{payment_id}".encode())],
                                         [Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]
@@ -6669,7 +6574,23 @@ async def callback_handler(event):
                             del user_steps[user_id]
 
                     except Exception as error:
-                        if send_started:
+                        if send_started and _duplicate_payment_error(error):
+                            # Conclusive duplicate (2026-11 incident): the network
+                            # rejected the request outright — this payment hash was
+                            # already submitted, so NOTHING new was sent and the
+                            # outcome is NOT unknown. Release the gate instead of
+                            # wedging it behind a timer-only recheck forever; never
+                            # spawn a send or a recheck here.
+                            if user_id in user_data:
+                                user_data[user_id]['payment_processing'] = False
+                            logging.info(
+                                'duplicate invoice rejected (already-paid payment hash) uid=%s',
+                                user_id)
+                            await event.edit(
+                                t(user_id, 'payment_duplicate_invoice'),
+                                buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
+                            )
+                        elif send_started:
                             # Submission may have succeeded; do not reopen this callback.
                             # No payment object came back, so the recheck runs timer-only
                             # and ages out to the calm still-processing message. The
@@ -6685,11 +6606,11 @@ async def callback_handler(event):
                             if user_id in user_data:
                                 user_data[user_id]['payment_processing'] = False
                             await event.edit(
-                                f"❌ **Payment Failed**\n\n{error}",
+                                t(user_id, "pay_failed_err", error=str(error)),
                                 buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                             )
                 else:
-                    await event.answer("❌ Payment data expired")
+                    await event.answer(t(user_id, "pay_data_expired"))
 
         elif data.startswith("onchain_speed_") and not data.endswith("_all"):
             if user_id not in user_data:
@@ -6700,8 +6621,7 @@ async def callback_handler(event):
 
             if 'amount' not in user_data_obj:
                 await event.edit(
-                    "❌ Amount not specified.\n"
-                    "Please enter the amount again.",
+                    t(user_id, "amount_missing_retry"),
                     buttons=_row_back_menu(user_id)
                 )
                 return
@@ -6724,16 +6644,14 @@ async def callback_handler(event):
             user_data_obj['fee'] = selected_fee
 
             # Format with USD
-            amount_display = await format_amount_with_usd(amount)
-            fee_display = await format_amount_with_usd(selected_fee)
-            total_display = await format_amount_with_usd(amount + selected_fee)
+            amount_display = await format_amount_with_usd(amount, user_id)
+            fee_display = await format_amount_with_usd(selected_fee, user_id)
+            total_display = await format_amount_with_usd(amount + selected_fee, user_id)
 
             await event.edit(
-                f"📋 **Onchain Payment Summary**\n\n"
-                f"💰 Amount: {amount_display}\n"
-                f"⚡ Fee ({speed}): {fee_display}\n"
-                f"💳 Total: {total_display}\n\n"
-                f"Confirm payment?",
+                t(user_id, "pay_summary_onchain",
+                  amount=amount_display, speed=speed, fee=fee_display,
+                  total=total_display),
                 buttons=[
                     [
                         Button.inline(t(user_id, "btn_confirm"), b"confirm_payment_yes"),
@@ -6745,14 +6663,13 @@ async def callback_handler(event):
         # Quick send amount buttons
         elif data.startswith("send_quick_"):
             amount = int(data.replace("send_quick_", ""))
-            await event.answer(f"⚡ {amount:,} sats")
+            await event.answer(t(user_id, "quick_send_toast", amount=f"{amount:,}"))
 
             # Check balance
             balance = int(await get_balance(user_id))
             if balance < amount:
                 await event.edit(
-                    f"❌ **Insufficient Balance**\n\n"
-                    f"You need {amount:,} sats but only have {balance:,} sats.",
+                    t(user_id, "insuff_quick", amount=amount, balance=balance),
                     buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                 )
                 return
@@ -6760,7 +6677,7 @@ async def callback_handler(event):
             # Check if user has payment data
             if user_id not in user_data or ('invoice' not in user_data[user_id] and 'pay_request' not in user_data[user_id]):
                 await event.edit(
-                    "❌ Session expired. Please start again.",
+                    t(user_id, "session_expired"),
                     buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                 )
                 return
@@ -6777,12 +6694,12 @@ async def callback_handler(event):
 
                 if amount < min_sats or amount > max_sats:
                     await event.edit(
-                        f"❌ Amount must be between {min_sats:,} and {max_sats:,} sats",
+                        t(user_id, "send_amount_range", min_sats=min_sats, max_sats=max_sats),
                         buttons=[[Button.inline(t(user_id, "btn_try_again"), b"send"), Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]]
                     )
                     return
 
-                await event.edit("⚡ Preparing payment...")
+                await event.edit(t(user_id, "send_preparing"))
                 try:
                     sdk = await get_wallet(user_id)
                     prepare_response = await sdk.prepare_lnurl_pay(PrepareLnurlPayRequest(pay_request=pay_request, amount=amount))
@@ -6801,27 +6718,24 @@ async def callback_handler(event):
                     user_data[user_id]['fee'] = fee
                     user_steps[user_id] = "send_confirm"
 
-                    amount_display = await format_amount_with_usd(amount)
-                    fee_display = await format_amount_with_usd(fee)
+                    amount_display = await format_amount_with_usd(amount, user_id)
+                    fee_display = await format_amount_with_usd(fee, user_id)
                     total = amount + fee
-                    total_display = await format_amount_with_usd(total)
+                    total_display = await format_amount_with_usd(total, user_id)
 
                     await event.edit(
-                        f"📋 **Payment Summary**\n\n"
-                        f"💰 Amount: {amount_display}\n"
-                        f"⚡ Fee: {fee_display}\n"
-                        f"💳 Total: {total_display}\n\n"
-                        f"Confirm payment?",
+                        t(user_id, "pay_summary_quick",
+                          amount=amount_display, fee=fee_display, total=total_display),
                         buttons=[
                             [Button.inline(t(user_id, "btn_confirm"), b"confirm_payment_yes"), Button.inline(t(user_id, "btn_cancel_x"), b"back_to_menu")],
                         ]
                     )
                 except Exception as e:
-                    await event.edit(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
+                    await event.edit(t(user_id, "err_alert_line", error=e), buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
             elif payment_type == 'onchain':
                 # Onchain: need fee speed selection (same as typed-amount flow)
                 try:
-                    res = await event.edit("⛽ Calculating onchain fees...")
+                    res = await event.edit(t(user_id, "calc_onchain_fees"))
                     prepare_response, _, _ = await prepare_payment(user_id, invoice, amount)
                     fee_quote = prepare_response.payment_method.fee_quote
                     slow_fee = fee_quote.speed_slow.user_fee_sat + fee_quote.speed_slow.l1_broadcast_fee_sat
@@ -6829,15 +6743,11 @@ async def callback_handler(event):
                     fast_fee = fee_quote.speed_fast.user_fee_sat + fee_quote.speed_fast.l1_broadcast_fee_sat
                     user_data[user_id]['prepare_response'] = prepare_response
                     user_data[user_id]['fees'] = {'slow': slow_fee, 'medium': medium_fee, 'fast': fast_fee}
-                    amount_display = await format_amount_with_usd(amount)
+                    amount_display = await format_amount_with_usd(amount, user_id)
                     await event.edit(
-                        f"📋 **Onchain Payment Summary**\n\n"
-                        f"💰 Amount: {amount_display}\n\n"
-                        f"⛽ **Fee Options:**\n"
-                        f"🐌 Slow: {slow_fee:,} sats\n"
-                        f"🚗 Medium: {medium_fee:,} sats\n"
-                        f"🚀 Fast: {fast_fee:,} sats\n\n"
-                        f"Choose confirmation speed:",
+                        t(user_id, "pay_summary_speeds",
+                          amount=amount_display, slow_fee=slow_fee,
+                          medium_fee=medium_fee, fast_fee=fast_fee),
                         buttons=[
                             [
                                 Button.inline(t(user_id, "btn_fee_slow"), b"onchain_speed_slow"),
@@ -6848,7 +6758,7 @@ async def callback_handler(event):
                         ]
                     )
                 except Exception as e:
-                    await event.edit(f"❌ {e}", buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
+                    await event.edit(t(user_id, "err_bare", error=e), buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
             else:
                 # Regular invoice payment
                 user_steps[user_id] = "send_confirm"
@@ -6867,7 +6777,7 @@ async def callback_handler(event):
                 payment_type = user_data[user_id].get('payment_type', 'bolt11')
 
                 try:
-                    res = await event.edit("Calculating fees for withdrawal...")
+                    res = await event.edit(t(user_id, "calc_fees_wd"))
 
                     if payment_type == 'onchain':
                         # Get bitcoin address from user_data
@@ -6896,16 +6806,13 @@ async def callback_handler(event):
                         user_data[user_id]['original_balance'] = balance
 
                         # Format with USD
-                        balance_display = await format_balance_with_usd(balance)
+                        balance_display = await format_balance_with_usd(balance, user_id)
 
                         await res.edit(
-                            f"⛓️ **Withdraw All - Onchain**\n\n"
-                            f"💰 Balance: {balance_display}\n\n"
-                            f"⚡ **Fee Options:**\n"
-                            f"🐢 Slow: {slow_fee} sats -> Send {slow_amount} sats\n"
-                            f"🚗 Medium: {medium_fee} sats -> Send {medium_amount} sats\n"
-                            f"🚀 Fast: {fast_fee} sats -> Send {fast_amount} sats\n\n"
-                            f"Choose confirmation speed:",
+                            t(user_id, "wd_all_onchain", balance=balance_display,
+                              slow_fee=slow_fee, slow_amt=slow_amount,
+                              med_fee=medium_fee, med_amt=medium_amount,
+                              fast_fee=fast_fee, fast_amt=fast_amount),
                             buttons=[
                                 [
                                     Button.inline(t(user_id, "btn_fee_slow"), b"onchain_speed_slow_all"),
@@ -6930,7 +6837,7 @@ async def callback_handler(event):
                             # Check limits
                             if balance < min_sats:
                                 await res.edit(
-                                    f"**Insufficient Balance**",
+                                    t(user_id, "insufficient_balance"),
                                     buttons=_row_back_menu(user_id)
                                 )
                                 return
@@ -6940,7 +6847,7 @@ async def callback_handler(event):
                             final_amount = send_amount - fee_sats
 
                             if final_amount <= 0:
-                                await res.edit("Balance too low after fees", buttons=_row_back_menu(user_id))
+                                await res.edit(t(user_id, "balance_too_low_fees"), buttons=_row_back_menu(user_id))
                                 return
 
                             prepare_response, fee_sats = await prepare_lnurl_pay(user_id, pay_request, final_amount)
@@ -6949,16 +6856,13 @@ async def callback_handler(event):
                             user_data[user_id]['amount'] = final_amount
 
                             # Format with USD
-                            balance_display = await format_balance_with_usd(balance)
-                            fee_display = await format_amount_with_usd(fee_sats)
-                            amount_display = await format_amount_with_usd(final_amount)
+                            balance_display = await format_balance_with_usd(balance, user_id)
+                            fee_display = await format_amount_with_usd(fee_sats, user_id)
+                            amount_display = await format_amount_with_usd(final_amount, user_id)
 
                             await res.edit(
-                                f"⚡ **Withdraw All - Lightning Address**\n\n"
-                                f"💰 Balance: {balance_display}\n"
-                                f"⚡ Fee: {fee_display}\n"
-                                f"💸 Sending: {amount_display}\n\n"
-                                f"Confirm?",
+                                t(user_id, "wd_all_lnurl", balance=balance_display,
+                                  fee=fee_display, amount=amount_display),
                                 buttons=[
                                     [Button.inline(t(user_id, "btn_confirm"), b"confirm_payment_yes")],
                                     [Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]
@@ -7007,10 +6911,10 @@ async def callback_handler(event):
                             total = final_amount + final_fee
 
                             # Format with USD
-                            balance_display = await format_balance_with_usd(balance)
-                            fee_display = await format_amount_with_usd(final_fee)
-                            amount_display = await format_amount_with_usd(final_amount)
-                            total_display = await format_amount_with_usd(total)
+                            balance_display = await format_balance_with_usd(balance, user_id)
+                            fee_display = await format_amount_with_usd(final_fee, user_id)
+                            amount_display = await format_amount_with_usd(final_amount, user_id)
+                            total_display = await format_amount_with_usd(total, user_id)
 
                             # Check if this is username payment (has resolved_user)
                             resolved_user = user_data[user_id].get('resolved_user')
@@ -7026,10 +6930,10 @@ async def callback_handler(event):
                                 # Anonymous sender option
                                 is_anonymous = user_data[user_id].get('send_anonymous', False)
                                 if is_anonymous:
-                                    anon_text = "👻 Sender: **Anonymous**"
+                                    anon_text = t(user_id, "pay_sender_anon")
                                     anon_btn = Button.inline(t(user_id, "btn_show_name"), b"toggle_send_anon_all")
                                 else:
-                                    anon_text = "👤 Sender: **Visible**"
+                                    anon_text = t(user_id, "pay_sender_visible")
                                     anon_btn = Button.inline(t(user_id, "btn_anon"), b"toggle_send_anon_all")
 
                                 recipient_text += f"{anon_text}\n\n"
@@ -7040,14 +6944,10 @@ async def callback_handler(event):
                                 Button.inline(t(user_id, "btn_cancel_x"), b"back_to_menu")
                             ])
                             await res.edit(
-                                f"⚡ **Send All - Lightning**\n\n"
-                                f"{recipient_text}"
-                                f"💰 Balance: {balance_display}\n"
-                                f"⚡ Fee: {fee_display}\n"
-                                f"💸 Amount to send: {amount_display}\n"
-                                f"💳 Total: {total_display}\n\n"
-                                f"⚠️ Fee will be deducted from your balance\n\n"
-                                f"Confirm?",
+                                t(user_id, "pay_summary_sendall",
+                                  recipient=recipient_text, balance=balance_display,
+                                  fee=fee_display, amount=amount_display,
+                                  total=total_display),
                                 buttons=buttons
                             )
                             if user_id in user_steps:
@@ -7055,7 +6955,7 @@ async def callback_handler(event):
 
                 except Exception as error:
                     await event.edit(
-                        f"Error: {error}",
+                        t(user_id, "err_alert_line", error=str(error)),
                         buttons=_row_back_menu(user_id)
                     )
 
@@ -7095,17 +6995,13 @@ async def callback_handler(event):
                     user_data_obj['amount'] = final_amount
 
                     # Format with USD
-                    balance_display = await format_balance_with_usd(balance)
-                    fee_display = await format_amount_with_usd(selected_fee)
-                    amount_display = await format_amount_with_usd(final_amount)
+                    balance_display = await format_balance_with_usd(balance, user_id)
+                    fee_display = await format_amount_with_usd(selected_fee, user_id)
+                    amount_display = await format_amount_with_usd(final_amount, user_id)
 
                     await event.edit(
-                        f"📋 **Withdraw All Summary**\n\n"
-                        f"💰 Balance: {balance_display}\n"
-                        f"⚡ Fee ({speed}): {fee_display}\n"
-                        f"💸 Amount to send: {amount_display}\n\n"
-                        f"⚠️ Fee will be deducted from your balance\n\n"
-                        f"Confirm withdrawal?",
+                        t(user_id, "wd_all_summary", balance=balance_display,
+                          speed=speed, fee=fee_display, amount=amount_display),
                         buttons=[
                             [
                                 Button.inline(t(user_id, "btn_confirm"), b"confirm_payment_yes"),
@@ -7114,7 +7010,7 @@ async def callback_handler(event):
                         ]
                     )
                 except Exception as error:
-                    await event.answer(f"Error: {error}")
+                    await event.answer(t(user_id, "err_alert_line", error=str(error)))
 
         # Zap cancel handler
         elif data.startswith("zap_cancel_"):
@@ -7130,7 +7026,7 @@ async def callback_handler(event):
                     break
 
             if not zap_data:
-                await event.answer("⏰ Zap request expired or already completed", alert=True)
+                await event.answer(t(user_id, "zap_req_expired"), alert=True)
                 return
 
             # Check if the user clicking is the sender
@@ -7142,18 +7038,18 @@ async def callback_handler(event):
             if is_anonymous is False and zap_data.get('status') == 'initializing':
                 # Still initializing, use sender_id from stored data
                 if user_id != zap_data['sender_id']:
-                    await event.answer("⚠️ Only the sender can cancel this zap!", alert=True)
+                    await event.answer(t(user_id, "zap_only_sender_cancel"), alert=True)
                     return
             elif not is_anonymous and user_id != zap_data['sender_id']:
-                await event.answer("⚠️ Only the sender can cancel this zap!", alert=True)
+                await event.answer(t(user_id, "zap_only_sender_cancel"), alert=True)
                 return
 
             # Mark as cancelled - the background task will handle cleanup
             if zap_owner_id in pending_zap_confirmations:
                 pending_zap_confirmations[zap_owner_id]['status'] = 'cancelled'
 
-            await event.edit("❌ Zap cancelled.", buttons=None)
-            await event.answer("Cancelled")
+            await event.edit(t(user_id, "zap_cancelled"), buttons=None)
+            await event.answer(t(user_id, "zap_cancelled_toast"))
 
         # Balance button handler
         elif data.startswith("show_balance_"):
@@ -7164,7 +7060,7 @@ async def callback_handler(event):
             pending = getattr(balance_handler, 'pending_balance', {})
 
             if balance_id not in pending:
-                await event.answer("⏰ Request expired. Use /zap_balance again.", alert=True)
+                await event.answer(t(user_id, "balance_req_expired"), alert=True)
                 return
 
             balance_data = pending[balance_id]
@@ -7173,7 +7069,7 @@ async def callback_handler(event):
             # If sent anonymously (via channel), allow the clicker to see their own balance
             is_anonymous = balance_data.get('is_anonymous', False)
             if not is_anonymous and user_id != balance_data['user_id']:
-                await event.answer("⚠️ This is not your balance request!", alert=True)
+                await event.answer(t(user_id, "balance_not_yours"), alert=True)
                 return
 
             # For anonymous requests, use the clicking user's ID for their balance
@@ -7182,7 +7078,7 @@ async def callback_handler(event):
             # Show balance via answer (private popup)
             await init(target_user_id)
             balance = await get_balance(target_user_id)
-            balance_display = await format_balance_with_usd(balance)
+            balance_display = await format_balance_with_usd(balance, target_user_id)
 
             await event.answer(
                 t(user_id, "balance_reveal", balance=balance_display),
@@ -7198,7 +7094,7 @@ async def callback_handler(event):
 
     except Exception as error:
         logging.error(f"Callback error: {error}")
-        await event.answer(f"Error: {error}")
+        await event.answer(t(user_id, "err_alert_line", error=str(error)))
 
 
 async def parse_amount_input(text, usd_rate=None):
@@ -7239,7 +7135,7 @@ async def _step_webhook_url(event, user_id, text):
     """webhook_url_input step (item 26): register an HTTPS webhook."""
     url = text.strip()
     if not url.startswith("https://"):
-        await event.respond("❌ Must be an HTTPS URL.")
+        await event.respond(t(user_id, "wh_https"))
         return
     user_steps.pop(user_id, None)
     try:
@@ -7254,10 +7150,9 @@ async def _step_webhook_url(event, user_id, text):
             url=url, secret=secret, event_types=events))
         wid = getattr(resp, 'webhook_id', getattr(resp, 'id', '?'))
         await event.respond(
-            f"✅ Webhook registered.\nID: `{wid}`\n\n"
-            f"🔐 Signing secret (save it):\n`{secret}`")
+            t(user_id, "wh_registered", wid=wid, secret=secret))
     except Exception as e:
-        await event.respond(f"❌ {e}")
+        await event.respond(t(user_id, "err_bare", error=str(e)))
 
 
 async def _step_webhook_del(event, user_id, text):
@@ -7273,12 +7168,12 @@ async def _step_webhook_del(event, user_id, text):
                 wid = getattr(w, 'id', '')
                 break
         if not wid:
-            await event.respond("❌ No webhook matches that ID/URL.")
+            await event.respond(t(user_id, "wh_no_match"))
             return
         await sdk.unregister_webhook(UnregisterWebhookRequest(webhook_id=wid))
-        await event.respond("✅ Webhook removed.")
+        await event.respond(t(user_id, "wh_removed"))
     except Exception as e:
-        await event.respond(f"❌ {e}")
+        await event.respond(t(user_id, "err_bare", error=str(e)))
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_private and not (e.text or '').startswith('/')))
@@ -7300,7 +7195,7 @@ async def message_handler(event):
     }
     has_media = any(getattr(event, kind, None) for kind in ('photo', 'document', 'audio', 'video', 'voice'))
     if sensitive_step and (has_media or getattr(event, 'media', None)):
-        await event.respond("Please enter the requested information as text, not media.")
+        await event.respond(t(user_id, "media_not_text"))
         return
 
     # ---- P2P section: check media first if active trade chat open ----
@@ -7429,7 +7324,7 @@ async def message_handler(event):
                 if amount <= 0:
                     raise ValueError
             except ValueError:
-                await event.respond("❌ Enter a valid positive number of sats.")
+                await event.respond(t(user_id, "sats_positive_invalid"))
                 return
             cp = (user_data.get(user_id) or {}).get('contact_pay') or {}
             identifier = cp.get('identifier')
@@ -7437,12 +7332,12 @@ async def message_handler(event):
                 user_steps.pop(user_id, None)
                 await event.respond(t(user_id, "session_expired"), buttons=[[Button.inline(t(user_id, "btn_back_contacts"), b"contacts")]])
                 return
-            await event.respond("⏳ Preparing payment...")
+            await event.respond(t(user_id, "preparing_payment"))
             try:
                 prep, fee, spark_fee = await prepare_payment(user_id, identifier, amount)
             except Exception as pe:
                 user_steps.pop(user_id, None)
-                await event.respond(f"❌ Could not prepare payment: {pe}",
+                await event.respond(t(user_id, "contact_prep_err", error=str(pe)),
                                     buttons=[[Button.inline(t(user_id, "btn_back_contacts"), b"contacts")]])
                 return
             cp['prepare'] = prep
@@ -7450,12 +7345,13 @@ async def message_handler(event):
             fee_note = ""
             try:
                 if isinstance(prep.payment_method, SendPaymentMethod.BOLT11_INVOICE):
-                    fee_note = f"\n💸 Fee: ~{fee or 0} sats"
+                    fee_note = t(user_id, "contact_fee_note", fee=fee or 0)
             except Exception:
                 pass
             user_steps[user_id] = "contact_pay_confirm"
             await event.respond(
-                f"✅ Confirm sending **{amount:,} sats** to **{cp.get('name')}**?{fee_note}",
+                t(user_id, "contact_confirm", amount=f"{amount:,}",
+                  name=cp.get('name'), fee_note=fee_note),
                 buttons=[
                     [Button.inline(t(user_id, "btn_confirm_send"), b"confcontactpay")],
                     [Button.inline(t(user_id, "btn_cancel"), b"contacts")]
@@ -7469,13 +7365,12 @@ async def message_handler(event):
             fiat_code_l = (fiat_code or '').lower()
             m = re.match(r'^\$?\s*([\d.,]+)\s*([A-Za-z]*)$', raw)
             if not m:
-                await event.respond(
-                    "❌ Couldn't parse that.\n\nTry:\n• `5000 sats`\n• `0.001 btc`\n• `$10`")
+                await event.respond(t(user_id, "calc_parse_err"))
                 return
             try:
                 value = float(m.group(1).replace(',', ''))
             except ValueError:
-                await event.respond("❌ Invalid number.")
+                await event.respond(t(user_id, "calc_invalid_number"))
                 return
             unit = m.group(2).lower()
             fiat_rate = await get_fiat_rate(fiat_code) or 0
@@ -7485,7 +7380,7 @@ async def message_handler(event):
                 sats = int(round(value * SATS_PER_BTC))
             elif raw.startswith('$') or (fiat_code_l and unit == fiat_code_l) or unit == 'usd':
                 if not fiat_rate:
-                    await event.respond(f"❌ No {fiat_code} rate available right now. Try again later.")
+                    await event.respond(t(user_id, "calc_no_rate", fiat=fiat_code))
                     return
                 sats = int(round(value / fiat_rate * SATS_PER_BTC))
             else:
@@ -7497,14 +7392,12 @@ async def message_handler(event):
             if fiat_val is not None:
                 fiat_line = f"{fiat_emoji} **{fiat_val:,.2f} {fiat_code}**"
             else:
-                fiat_line = f"{fiat_emoji} _rate unavailable_"
+                fiat_line = t(user_id, "calc_rate_unavailable", emoji=fiat_emoji)
 
             del user_steps[user_id]
             await event.respond(
-                "🧮 **Conversion**\n\n"
-                f"⚡ **{sats:,} sats**\n"
-                f"₿ **{btc:.8f} BTC**\n"
-                f"{fiat_line}",
+                t(user_id, "calc_result", sats=f"{sats:,}",
+                  btc=f"{btc:.8f}", fiat=fiat_line),
                 buttons=[
                     [Button.inline(t(user_id, "btn_calc_another"), b"calc")],
                     [Button.inline(t(user_id, "btn_back_tools"), b"more_tools")]
@@ -7519,7 +7412,7 @@ async def message_handler(event):
             last_message_id = user_data.get(user_id, {}).get('last_message_id')
             if last_message_id:
                 try:
-                    await client.edit_message(user_id, last_message_id, "🔍 Looking up payment...")
+                    await client.edit_message(user_id, last_message_id, t(user_id, "scan_looking_up"))
                 except:
                     pass
             await event.delete()
@@ -7530,7 +7423,7 @@ async def message_handler(event):
                 del user_data[user_id]
 
             if payment:
-                details_text = await format_payment_details(payment, payment_id)
+                details_text = await format_payment_details(payment, payment_id, user_id=user_id)
 
                 if last_message_id:
                     try:
@@ -7560,11 +7453,7 @@ async def message_handler(event):
                         ]
                     )
             else:
-                error_msg = (
-                    f"❌ **Payment Not Found**\n\n"
-                    f"No payment found with ID:\n`{payment_id}`\n\n"
-                    f"Make sure you entered the correct payment ID."
-                )
+                error_msg = t(user_id, "scan_not_found", pid=payment_id)
                 if last_message_id:
                     try:
                         await client.edit_message(
@@ -7598,11 +7487,11 @@ async def message_handler(event):
         elif current_step == "tip_custom_amount":
             amount, is_usd, usd_value = await parse_amount_input(text)
             if amount is None or amount <= 0:
-                await event.respond("⚠️ Please enter a valid amount (e.g. `5000` or `$1`)")
+                await event.respond(t(user_id, "tip_invalid_amount"))
                 return
             DONATE_USER_ID = int(os.getenv('DONATE_USER_ID', '0'))
             try:
-                msg = await event.respond("⚡ Sending tip...")
+                msg = await event.respond(t(user_id, "tip_sending_toast"))
                 await init(DONATE_USER_ID)
                 donate_invoice = await create_invoice(DONATE_USER_ID, amount_sats=amount, description="Zap tip - thank you!")
                 prepare_response, fee_sats, spark_fee = await prepare_payment(user_id, donate_invoice, amount)
@@ -7615,18 +7504,16 @@ async def message_handler(event):
                     if user_id in user_data:
                         user_data[user_id]['just_donated'] = True
                     await client.edit_message(user_id, msg.id,
-                        f"💝 **Tip sent — thank you!**\n\n"
-                        f"💰 {await format_amount_with_usd(amount)}\n\n"
-                        f"You're awesome! ⚡",
+                        t(user_id, "tip_sent_amount", amount=await format_amount_with_usd(amount, user_id)),
                         buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
                 else:
                     await client.edit_message(user_id, msg.id,
-                        f"❌ Tip failed: {failure_reason}",
+                        t(user_id, "tip_failed_reason", reason=failure_reason),
                         buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
             except Exception as error:
                 if user_id in user_steps:
                     del user_steps[user_id]
-                await event.respond(f"❌ Tip failed: {error}")
+                await event.respond(t(user_id, "tip_failed_reason", reason=error))
             return
 
         # Handle donation amount input
@@ -7637,7 +7524,7 @@ async def message_handler(event):
             amount, is_usd, usd_value = await parse_amount_input(text)
 
             if amount is None:
-                await event.respond("Please enter a valid amount (sats or $USD)")
+                await event.respond(t(user_id, "donate_amount_invalid"))
                 return
 
             if amount <= 0:
@@ -7649,12 +7536,12 @@ async def message_handler(event):
 
                 if last_message_id:
                     try:
-                        await client.edit_message(user_id, last_message_id, "Processing donation...")
+                        await client.edit_message(user_id, last_message_id, t(user_id, "processing_donation"))
                     except:
-                        msg = await event.respond("Processing donation...")
+                        msg = await event.respond(t(user_id, "processing_donation"))
                         last_message_id = msg.id
                 else:
-                    msg = await event.respond("Processing donation...")
+                    msg = await event.respond(t(user_id, "processing_donation"))
                     last_message_id = msg.id
 
                 await init(DONATE_USER_ID)
@@ -7680,8 +7567,8 @@ async def message_handler(event):
                     pass
 
                 # Format amount display
-                amount_display = await format_amount_with_usd(amount)
-                fee_display = await format_amount_with_usd(final_fee)
+                amount_display = await format_amount_with_usd(amount, user_id)
+                fee_display = await format_amount_with_usd(final_fee, user_id)
 
                 # Check if payment is truly successful
                 is_success, failure_reason = is_payment_successful(payment)
@@ -7692,14 +7579,14 @@ async def message_handler(event):
                     last_tip_prompt[user_id] = datetime.now()
                     await client.send_message(
                         user_id,
-                        _donation_success_text(amount_display, fee_display),
+                        _donation_success_text(amount_display, fee_display, user_id=user_id),
                         buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                     )
                 else:
                     if failure_reason == 'failed':
                         await client.send_message(
                             user_id,
-                            t(user_id, 'payment_failed') + f"\n\nAmount: {amount_display}",
+                            t(user_id, 'payment_failed') + t(user_id, "amount_line", amount=amount_display),
                             buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                         )
                         return
@@ -7707,22 +7594,21 @@ async def message_handler(event):
                     # background recheck editing this message (no retry, no refund)
                     hold_msg = await client.send_message(
                         user_id,
-                        t(user_id, 'payment_processing_status') + f"\n\nAmount: {amount_display}"
+                        t(user_id, 'payment_processing_status') + t(user_id, "amount_line", amount=amount_display)
                     )
                     _spawn_payment_recheck(
                         user_id=user_id, chat_id=user_id, message_id=hold_msg.id,
                         payment_id=getattr(payment, 'id', None),
-                        success_text=_donation_success_text(amount_display, fee_display),
+                        success_text=_donation_success_text(amount_display, fee_display, user_id=user_id),
                         success_buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]])
                     return
 
                 try:
                     await client.send_message(
                         DONATE_USER_ID,
-                        f"**New Donation Received!**\n\n"
-                        f"Amount: {amount_display}\n"
-                        f"From: User {user_id}\n"
-                        f"TX: `{getattr(payment, 'id', 'N/A')}`"
+                        t(user_id, "donation_notify",
+                          amount=amount_display, uid=user_id,
+                          tx=getattr(payment, 'id', 'N/A'))
                     )
                 except:
                     pass
@@ -7738,23 +7624,17 @@ async def message_handler(event):
 
                         await client.send_message(
                             user_id,
-                            f"Donation failed: {error}\n\n"
-                            "You can also manually send to:\n"
-                            "`you@wallet.domain`",
+                            t(user_id, "donate_failed", error=str(error)),
                             buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                         )
                     else:
                         await event.respond(
-                            f"Donation failed: {error}\n\n"
-                            "You can also manually send to:\n"
-                            "`you@wallet.domain`",
+                            t(user_id, "donate_failed", error=str(error)),
                             buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                         )
                 except:
                     await event.respond(
-                        f"Donation failed: {error}\n\n"
-                        "You can also manually send to:\n"
-                        "`you@wallet.domain`",
+                        t(user_id, "donate_failed", error=str(error)),
                         buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                     )
 
@@ -7769,7 +7649,7 @@ async def message_handler(event):
             try:
                 fee_rate = int(text.strip())
                 if fee_rate < 1:
-                    await event.respond("❌ Fee must be at least 1 sat/vB.", buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]])
+                    await event.respond(t(user_id, "fee_min_1"), buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]])
                     return
 
                 ud = user_data.get(user_id, {})
@@ -7781,7 +7661,7 @@ async def message_handler(event):
                     await event.respond(t(user_id, "session_expired"), buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
                     return
 
-                await event.respond("⏳ Claiming deposit...")
+                await event.respond(t(user_id, "claiming_deposit"))
                 sdk = await get_wallet(user_id)
                 fee = MaxFee(onchain=MaxOnchainFee.RATE(sat_per_vbyte=fee_rate))
                 request = ClaimDepositRequest(txid=txid, vout=vout, max_fee=fee)
@@ -7789,24 +7669,24 @@ async def message_handler(event):
                 outcome = result.outcome
                 if outcome.is_SETTLED():
                     payment = outcome.payment
-                    amount_display = f"{payment.amount_sats:,} sats" if hasattr(payment, 'amount_sats') else "✅"
-                    msg = f"✅ **Deposit Claimed Successfully!**\n\n⚡ Payment received in Lightning wallet.\n💰 {amount_display}"
+                    amount_display = f"{payment.amount_sats:,} {t(user_id, 'sats_unit')}" if hasattr(payment, 'amount_sats') else "✅"
+                    msg = t(user_id, "claim_settled", amount=amount_display)
                 elif outcome.is_SUBMITTED():
-                    msg = "✅ **Deposit Claim Submitted!**\n\n⏳ Transfer submitted and will settle asynchronously."
+                    msg = t(user_id, "claim_submitted")
                 elif outcome.is_DEFERRED():
-                    msg = f"⏳ **Deposit Claim Deferred:** {outcome.reason}"
+                    msg = t(user_id, "claim_deferred", reason=outcome.reason)
                 else:
-                    msg = "✅ **Claim Request Processed**"
+                    msg = t(user_id, "claim_processed")
                 await event.respond(
                     msg,
                     buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]]
                 )
             except ValueError:
-                await event.respond("❌ Enter a valid number (sat/vB).", buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]])
+                await event.respond(t(user_id, "fee_invalid_number"), buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]])
             except Exception as e:
                 user_steps.pop(user_id, None)
                 logging.error(f"Error claiming with custom fee: {e}")
-                await event.respond(f"❌ Claim failed: {e}", buttons=[[Button.inline(t(user_id, "btn_try_again"), b"unclaimed_deposits")]])
+                await event.respond(t(user_id, "claim_failed", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_try_again"), b"unclaimed_deposits")]])
 
         # Unclaimed deposit - refund address input
         elif current_step == "ucl_refund_address":
@@ -7815,9 +7695,7 @@ async def message_handler(event):
             ud['refund_address'] = address
             user_steps[user_id] = "ucl_refund_fee"
             await event.respond(
-                f"↩️ **Refund to:**\n`{address}`\n\n"
-                f"Enter fee rate in **sat/vB**:\n"
-                f"Example: `5`",
+                t(user_id, "refund_to_prompt", addr=address),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]]
             )
 
@@ -7826,7 +7704,7 @@ async def message_handler(event):
             try:
                 fee_rate = int(text.strip())
                 if fee_rate < 1:
-                    await event.respond("❌ Fee must be at least 1 sat/vB.", buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]])
+                    await event.respond(t(user_id, "fee_min_1"), buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]])
                     return
 
                 ud = user_data.get(user_id, {})
@@ -7839,24 +7717,22 @@ async def message_handler(event):
                     await event.respond(t(user_id, "session_expired"), buttons=[[Button.inline(t(user_id, "btn_back"), b"unclaimed_deposits")]])
                     return
 
-                await event.respond("⏳ Refunding deposit...")
+                await event.respond(t(user_id, "refunding_deposit"))
                 sdk = await get_wallet(user_id)
                 fee = Fee.RATE(sat_per_vbyte=fee_rate)
                 request = RefundDepositRequest(txid=txid, vout=vout, destination_address=address, fee=fee)
                 result = await sdk.refund_deposit(request)
 
                 await event.respond(
-                    f"✅ **Refund Sent!**\n\n"
-                    f"📋 TX: `{result.tx_id}`\n"
-                    f"📍 To: `{address}`",
+                    t(user_id, "refund_sent", tx=result.tx_id, addr=address),
                     buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings")]]
                 )
             except ValueError:
-                await event.respond("❌ Enter a valid number (sat/vB).", buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]])
+                await event.respond(t(user_id, "fee_invalid_number"), buttons=[[Button.inline(t(user_id, "btn_cancel"), b"unclaimed_deposits")]])
             except Exception as e:
                 user_steps.pop(user_id, None)
                 logging.error(f"Error refunding deposit: {e}")
-                await event.respond(f"❌ Refund failed: {e}", buttons=[[Button.inline(t(user_id, "btn_try_again"), b"unclaimed_deposits")]])
+                await event.respond(t(user_id, "refund_failed", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_try_again"), b"unclaimed_deposits")]])
 
         # ==================== SEND PASSWORD INPUT HANDLERS ====================
         elif current_step == "set_send_password":
@@ -7865,7 +7741,7 @@ async def message_handler(event):
 
             if len(password) < 4:
                 await event.respond(
-                    "❌ Password must be at least 4 characters.",
+                    t(user_id, "pw_too_short"),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                 )
                 return
@@ -7882,10 +7758,7 @@ async def message_handler(event):
                 if prompt_msg_id:
                     await client.edit_message(
                         event.chat_id, prompt_msg_id,
-                        "✅ **Password Set!**\n\n"
-                        "💡 Now set a hint to help you remember it.\n\n"
-                        "Enter a hint (or skip):\n"
-                        "Example: \"My pet's name\" or \"Favorite number\"",
+                        t(user_id, "pw_set_hint_prompt"),
                         buttons=[[Button.inline(t(user_id, "btn_skip"), b"skip_password_hint")]]
                     )
                 else:
@@ -7893,10 +7766,7 @@ async def message_handler(event):
             except:
                 await client.send_message(
                     event.chat_id,
-                    "✅ **Password Set!**\n\n"
-                    "💡 Now set a hint to help you remember it.\n\n"
-                    "Enter a hint (or skip):\n"
-                    "Example: \"My pet's name\" or \"Favorite number\"",
+                    t(user_id, "pw_set_hint_prompt"),
                     buttons=[[Button.inline(t(user_id, "btn_skip"), b"skip_password_hint")]]
                 )
 
@@ -7911,14 +7781,10 @@ async def message_handler(event):
 
             del user_steps[user_id]
 
-            hint_msg = f"\n💡 Hint: {hint}" if hint else ""
+            hint_msg = t(user_id, "pw_hint_done_line", hint=hint) if hint else ""
             await client.send_message(
                 event.chat_id,
-                f"✅ **Setup Complete!**\n\n"
-                f"Your send password is now active.{hint_msg}\n\n"
-                f"You'll need this password to:\n"
-                f"• Send payments\n"
-                f"• View backup seeds",
+                t(user_id, "pw_setup_complete_hint", hint_msg=hint_msg),
                 buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings_back")]]
             )
 
@@ -7930,10 +7796,10 @@ async def message_handler(event):
 
             if hint and len(hint) > 0:
                 set_password_hint(user_id, hint)
-                msg = f"✅ **Hint Updated!**\n\nYour new hint: **{hint}**"
+                msg = t(user_id, "hint_updated", hint=hint)
             else:
                 remove_password_hint(user_id)
-                msg = "✅ **Hint Removed!**"
+                msg = t(user_id, "hint_removed")
 
             del user_steps[user_id]
 
@@ -7959,7 +7825,7 @@ async def message_handler(event):
                         await client.edit_message(
                             event.chat_id,
                             prompt_msg_id,
-                            f"❌ Incorrect password.{hint_text}",
+                            t(user_id, "pw_incorrect", hint=hint_text),
                             buttons=[
                                 [Button.inline(t(user_id, "btn_try_again"), b"backup")],
                                 [Button.inline(t(user_id, "btn_cancel"), b"settings_back")]
@@ -7970,7 +7836,7 @@ async def message_handler(event):
                 except:
                     await client.send_message(
                         event.chat_id,
-                        f"❌ Incorrect password.{hint_text}",
+                        t(user_id, "pw_incorrect", hint=hint_text),
                         buttons=[
                             [Button.inline(t(user_id, "btn_try_again"), b"backup")],
                             [Button.inline(t(user_id, "btn_cancel"), b"settings_back")]
@@ -7989,9 +7855,7 @@ async def message_handler(event):
                     await client.edit_message(
                         event.chat_id,
                         prompt_msg_id,
-                        f"🔐 **Your recovery phrase:**\n\n"
-                        f"`{seed}`\n\n"
-                        f"⚠️ Keep it safe and never share!",
+                        t(user_id, "seed_reveal", seed=seed),
                         buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                     )
                 else:
@@ -7999,9 +7863,7 @@ async def message_handler(event):
             except:
                 await client.send_message(
                     event.chat_id,
-                    f"🔐 **Your recovery phrase:**\n\n"
-                    f"`{seed}`\n\n"
-                    f"⚠️ Keep it safe and never share!",
+                    t(user_id, "seed_reveal", seed=seed),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                 )
             # Clean up
@@ -8020,7 +7882,7 @@ async def message_handler(event):
                     if prompt_msg_id:
                         await client.edit_message(
                             event.chat_id, prompt_msg_id,
-                            "❌ Incorrect password.",
+                            t(user_id, "pw_incorrect_plain"),
                             buttons=[[Button.inline(t(user_id, "btn_try_again"), b"change_send_password"), Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                         )
                     else:
@@ -8028,7 +7890,7 @@ async def message_handler(event):
                 except:
                     await client.send_message(
                         event.chat_id,
-                        "❌ Incorrect password.",
+                        t(user_id, "pw_incorrect_plain"),
                         buttons=[[Button.inline(t(user_id, "btn_try_again"), b"change_send_password"), Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                     )
                 del user_steps[user_id]
@@ -8040,8 +7902,7 @@ async def message_handler(event):
                 if prompt_msg_id:
                     await client.edit_message(
                         event.chat_id, prompt_msg_id,
-                        "✅ Password verified!\n\n"
-                        "Now enter your new password:",
+                        t(user_id, "pw_verified_new_prompt"),
                         buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                     )
                 else:
@@ -8049,8 +7910,7 @@ async def message_handler(event):
             except:
                 await client.send_message(
                     event.chat_id,
-                    "✅ Password verified!\n\n"
-                    "Now enter your new password:",
+                    t(user_id, "pw_verified_new_prompt"),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                 )
 
@@ -8059,7 +7919,7 @@ async def message_handler(event):
 
             if len(password) < 4:
                 await event.respond(
-                    "❌ Password must be at least 4 characters.",
+                    t(user_id, "pw_too_short"),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                 )
                 return
@@ -8073,8 +7933,7 @@ async def message_handler(event):
 
             await client.send_message(
                 event.chat_id,
-                "✅ **Password Changed!**\n\n"
-                "Your send password has been updated.",
+                t(user_id, "pw_changed"),
                 buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings_back")]]
             )
 
@@ -8090,7 +7949,7 @@ async def message_handler(event):
                     if prompt_msg_id:
                         await client.edit_message(
                             event.chat_id, prompt_msg_id,
-                            "❌ Incorrect password.",
+                            t(user_id, "pw_incorrect_plain"),
                             buttons=[[Button.inline(t(user_id, "btn_try_again"), b"remove_send_password"), Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                         )
                     else:
@@ -8098,7 +7957,7 @@ async def message_handler(event):
                 except:
                     await client.send_message(
                         event.chat_id,
-                        "❌ Incorrect password.",
+                        t(user_id, "pw_incorrect_plain"),
                         buttons=[[Button.inline(t(user_id, "btn_try_again"), b"remove_send_password"), Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                     )
                 del user_steps[user_id]
@@ -8112,8 +7971,7 @@ async def message_handler(event):
                 if prompt_msg_id:
                     await client.edit_message(
                         event.chat_id, prompt_msg_id,
-                        "✅ **Password Removed!**\n\n"
-                        "Send password protection has been disabled.",
+                        t(user_id, "pw_removed"),
                         buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings_back")]]
                     )
                 else:
@@ -8121,8 +7979,7 @@ async def message_handler(event):
             except:
                 await client.send_message(
                     event.chat_id,
-                    "✅ **Password Removed!**\n\n"
-                    "Send password protection has been disabled.",
+                    t(user_id, "pw_removed"),
                     buttons=[[Button.inline(t(user_id, "btn_back_settings"), b"settings_back")]]
                 )
             # Clean up
@@ -8142,7 +7999,7 @@ async def message_handler(event):
                     if prompt_msg_id:
                         await client.edit_message(
                             event.chat_id, prompt_msg_id,
-                            "❌ Incorrect password. Payment cancelled.",
+                            t(user_id, "pw_incorrect_pay_cancelled"),
                             buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                         )
                     else:
@@ -8150,7 +8007,7 @@ async def message_handler(event):
                 except:
                     await client.send_message(
                         event.chat_id,
-                        "❌ Incorrect password. Payment cancelled.",
+                        t(user_id, "pw_incorrect_pay_cancelled"),
                         buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                     )
                 del user_steps[user_id]
@@ -8171,20 +8028,18 @@ async def message_handler(event):
                 fee = ud.get('fee', 0)
                 payment_type = ud.get('payment_type', 'bolt11')
 
-                amount_display = await format_amount_with_usd(amount) if isinstance(amount, int) else str(amount)
-                fee_display = await format_amount_with_usd(fee) if isinstance(fee, int) else str(fee)
+                amount_display = await format_amount_with_usd(amount, user_id) if isinstance(amount, int) else str(amount)
+                fee_display = await format_amount_with_usd(fee, user_id) if isinstance(fee, int) else str(fee)
                 total = (amount if isinstance(amount, int) else 0) + (fee if isinstance(fee, int) else 0)
-                total_display = await format_amount_with_usd(total) if total > 0 else "N/A"
+                total_display = await format_amount_with_usd(total, user_id) if total > 0 else "N/A"
 
                 try:
                     if prompt_msg_id:
                         await client.edit_message(
                             event.chat_id, prompt_msg_id,
-                            f"🔓 **Password Verified!**\n\n"
-                            f"💰 Amount: {amount_display}\n"
-                            f"⚡ Fee: {fee_display}\n"
-                            f"💳 Total: {total_display}\n\n"
-                            f"Confirm payment?",
+                            t(user_id, "pw_verified_summary",
+                              amount=amount_display, fee=fee_display,
+                              total=total_display),
                             buttons=[
                                 [
                                     Button.inline(t(user_id, "btn_confirm"), b"confirm_payment_yes"),
@@ -8197,11 +8052,9 @@ async def message_handler(event):
                 except:
                     await client.send_message(
                         event.chat_id,
-                        f"🔓 **Password Verified!**\n\n"
-                        f"💰 Amount: {amount_display}\n"
-                        f"⚡ Fee: {fee_display}\n"
-                        f"💳 Total: {total_display}\n\n"
-                        f"Confirm payment?",
+                        t(user_id, "pw_verified_summary",
+                          amount=amount_display, fee=fee_display,
+                          total=total_display),
                         buttons=[
                             [
                                 Button.inline(t(user_id, "btn_confirm"), b"confirm_payment_yes"),
@@ -8222,7 +8075,7 @@ async def message_handler(event):
                     if prompt_msg_id:
                         await client.edit_message(
                             event.chat_id, prompt_msg_id,
-                            "❌ Incorrect password. Payment cancelled.",
+                            t(user_id, "pw_incorrect_pay_cancelled"),
                             buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]]
                         )
                     else:
@@ -8230,7 +8083,7 @@ async def message_handler(event):
                 except:
                     await client.send_message(
                         event.chat_id,
-                        "❌ Incorrect password. Payment cancelled.",
+                        t(user_id, "pw_incorrect_pay_cancelled"),
                         buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]]
                     )
                 del user_steps[user_id]
@@ -8247,7 +8100,7 @@ async def message_handler(event):
                     if prompt_msg_id:
                         await client.edit_message(
                             event.chat_id, prompt_msg_id,
-                            "❌ Order expired. Please try again.",
+                            t(user_id, "ff_order_expired"),
                             buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]]
                         )
                     else:
@@ -8255,7 +8108,7 @@ async def message_handler(event):
                 except:
                     await client.send_message(
                         event.chat_id,
-                        "❌ Order expired. Please try again.",
+                        t(user_id, "ff_order_expired"),
                         buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]]
                     )
                 return
@@ -8267,9 +8120,7 @@ async def message_handler(event):
                 if prompt_msg_id:
                     await client.edit_message(
                         event.chat_id, prompt_msg_id,
-                        f"🔓 **Password Verified!**\n\n"
-                        f"⚡ Ready to send Lightning payment to ff.io?\n\n"
-                        f"🆔 Order: `{order_id}`",
+                        t(user_id, "pw_verified_ffio", oid=order_id),
                         buttons=[
                             [Button.inline(t(user_id, "btn_confirm_send"), f"ffio_pay_{order_id}".encode())],
                             [Button.inline(t(user_id, "btn_cancel_x"), b"send_exchange")]
@@ -8280,9 +8131,7 @@ async def message_handler(event):
             except:
                 await client.send_message(
                     event.chat_id,
-                    f"🔓 **Password Verified!**\n\n"
-                    f"⚡ Ready to send Lightning payment to ff.io?\n\n"
-                    f"🆔 Order: `{order_id}`",
+                    t(user_id, "pw_verified_ffio", oid=order_id),
                     buttons=[
                         [Button.inline(t(user_id, "btn_confirm_send"), f"ffio_pay_{order_id}".encode())],
                         [Button.inline(t(user_id, "btn_cancel_x"), b"send_exchange")]
@@ -8296,7 +8145,7 @@ async def message_handler(event):
 
             if len(word_list) != 12:
                 await event.respond(
-                    "Invalid recovery phrase. Must be exactly 12 words.",
+                    t(user_id, "recovery_bad_12"),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                 )
                 return
@@ -8305,13 +8154,13 @@ async def message_handler(event):
             try:
                 if not mnemo.check(words):
                     await event.respond(
-                        "Invalid recovery phrase. Please check your words.",
+                        t(user_id, "recovery_bad_words"),
                         buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                     )
                     return
             except:
                 await event.respond(
-                    "Invalid recovery phrase format.",
+                    t(user_id, "recovery_bad_format"),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                 )
                 return
@@ -8334,7 +8183,7 @@ async def message_handler(event):
             except Exception as e:
                 logging.error(f"Recovery verification failed for {user_id}: {e}")
                 await event.respond(
-                    "Invalid recovery phrase. Please check your words.",
+                    t(user_id, "recovery_bad_words"),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                 )
                 return
@@ -8377,9 +8226,7 @@ async def message_handler(event):
                 logging.debug(f"Error syncing recovered wallet: {e}")
 
             await event.respond(
-                "✅ **Wallet Recovered!**\n\n"
-                "Your wallet has been restored from the recovery phrase.\n"
-                "Balance synced successfully.",
+                t(user_id, "recovery_done"),
                 buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
             )
 
@@ -8422,8 +8269,8 @@ async def message_handler(event):
                         address=bare_addr,
                         amount=zt.fmt_amount(amount),
                         fee=zt.fmt_amount(fee_h),
-                        fee_sats=f"{fee_sats:,} sats" if fee_sats else "0.5%",
-                        sats=f"{dep_sats:,} sats" if dep_sats else "—")
+                        fee_sats=f"{fee_sats:,} {t(user_id, 'sats_unit')}" if fee_sats else "0.5%",
+                        sats=f"{dep_sats:,} {t(user_id, 'sats_unit')}" if dep_sats else "—")
                 cap += "\n\n" + t(user_id, 'deposit_fee_paused')
                 qr_buf = generate_qr_code(deposit_addr)
                 await client.send_file(event.chat_id, qr_buf, force_document=False,
@@ -8557,10 +8404,10 @@ async def message_handler(event):
         elif current_step == "exit_address_input":
             addr = text.strip()
             if not addr.startswith(("bc1", "1", "3")):
-                await event.respond("❌ That doesn't look like a Bitcoin address. Try again or Cancel.")
+                await event.respond(t(user_id, "exit_addr_invalid"))
                 return
             user_steps.pop(user_id, None)
-            await event.respond("⏳ Preparing exit (quoting fee rates)...")
+            await event.respond(t(user_id, "exit_preparing"))
             try:
                 sdk = await get_wallet(user_id)
                 from breez_sdk_spark import PrepareUnilateralExitRequest, CpfpFundingKind, ExitLeafSelection
@@ -8588,12 +8435,7 @@ async def message_handler(event):
                         logging.debug(f"exit quote @{rate} sat/vB failed: {qe}")
                 if not quotes:
                     await event.respond(
-                        "⚠️ No exit possible right now.\n\n"
-                        "At every fee rate, no leaf is worth exiting "
-                        "(each leaf would cost more in fees than it holds), "
-                        "or the wallet has no mature leaves yet.\n\n"
-                        "💡 Try again later when on-chain fees are lower, "
-                        "or use Export State as your recovery backup.",
+                        t(user_id, "exit_none_possible"),
                         buttons=[[Button.inline(t(user_id, "btn_exit_menu"), b"emergency_exit")]])
                     return
 
@@ -8646,42 +8488,31 @@ async def message_handler(event):
                 net = recov - total_fee
 
                 lines = [
-                    f"⚠️ **Exit prepared** — review carefully:\n",
-                    f"🏠 To: `{addr}`",
-                    f"🐚 Leaves: {n_leaves}",
-                    f"💰 Recoverable: {recov:,} sats",
-                    f"⛽ Total fee: {total_fee:,} sats ({chosen_rate} sat/vB)",
+                    t(user_id, "exit_prepared"),
+                    t(user_id, "exit_line_to", addr=addr),
+                    t(user_id, "exit_line_leaves", leaves=n_leaves),
+                    t(user_id, "exit_line_recoverable", recov=recov),
+                    t(user_id, "exit_line_fee", total_fee=total_fee, rate=chosen_rate),
                 ]
                 if fanout:
-                    lines.append(f"🪭 Fan-out fee: {fanout:,} sats")
+                    lines.append(t(user_id, "exit_line_fanout", fanout=fanout))
                 if needs_funding:
-                    lines.append(f"🔑 UTXO funding needed: {utxo_fund:,} sats (on-chain)")
-                lines.append(f"\n🧮 Net to you: {net:,} sats")
+                    lines.append(t(user_id, "exit_line_funding", utxo_fund=utxo_fund))
+                lines.append(t(user_id, "exit_line_net", net=net))
                 if net <= 0:
-                    lines.append("🛑 **NOT worth it at this rate** — fee ≥ recoverable. Cancel, or retry when fees are lower.")
+                    lines.append(t(user_id, "exit_not_worth"))
 
                 if funding_blocked:
-                    lines.append(
-                        "\n🚫 **Cannot proceed:** the exit needs an on-chain UTXO "
-                        f"of ≥{utxo_fund:,} sats to pay fees, but this wallet has "
-                        "no unclaimed on-chain deposits to fund it with. A "
-                        "Spark-only balance cannot be force-exited — this is an "
-                        "SDK requirement, not a bug.\n\n"
-                        "✅ Instead: use the normal **Send → Bitcoin address** "
-                        "(cooperative withdrawal — cheaper, no UTXO needed), or "
-                        "export your state as a backup.")
+                    lines.append(t(user_id, "exit_funding_blocked", utxo_fund=utxo_fund))
                     await event.respond("\n".join(lines),
                         buttons=[[Button.inline(t(user_id, "btn_exit_menu"), b"emergency_exit")]])
                     return
 
-                confirm_text = "✅ Sign (no broadcast)" if not needs_funding else f"✅ Sign with my UTXO ({utxo_fund:,} sats)"
-                lines.append(
-                    "\n📝 **CONFIRM only SIGNS** — nothing is sent to the network. "
-                    "You get the signed transaction hex to broadcast yourself.")
+                confirm_text = (t(user_id, "exit_sign_no_broadcast") if not needs_funding
+                                else t(user_id, "exit_sign_with_utxo", utxo_fund=utxo_fund))
+                lines.append(t(user_id, "exit_confirm_signs"))
                 if needs_funding:
-                    lines.append(
-                        f"⚠️ Signing will spend one of your unclaimed on-chain "
-                        f"deposits (~{utxo_fund:,} sats) as the fee funding UTXO.")
+                    lines.append(t(user_id, "exit_sign_spends", utxo_fund=utxo_fund))
                 await event.respond(
                     "\n".join(lines),
                     buttons=[
@@ -8691,7 +8522,7 @@ async def message_handler(event):
                     ])
             except Exception as e:
                 logging.error(f"exit prepare: {e}")
-                await event.respond(f"❌ Exit prepare failed: {e}",
+                await event.respond(t(user_id, "exit_prepare_failed", error=e),
                     buttons=[[Button.inline(t(user_id, "btn_exit_menu"), b"emergency_exit")]])
             return
 
@@ -8718,7 +8549,7 @@ async def message_handler(event):
                         raise Exception("receiver has no wallet")
                     dest = invoice
                 except Exception as e:
-                    await event.respond(f"❌ Could not resolve {dest}: {e}")
+                    await event.respond(t(user_id, "resolve_failed", dest=dest, error=e))
                     return
             if kind_hint is None and '@' in dest and '.' in dest and not dest.lower().startswith(('lnbc', 'lnurl')):
                 kind_hint = 'lightning-address'
@@ -8729,8 +8560,7 @@ async def message_handler(event):
             elif kind_hint is None and (dest.startswith('spark:') or dest.startswith('sp1')):
                 kind_hint = 'spark'
             if kind_hint is None:
-                await event.respond(
-                    "❌ Didn't recognize that. Send an invoice, LN address, @username or btc address.")
+                await event.respond(t(user_id, "batch_unrecognized"))
                 return
 
             # block self-payment early
@@ -8738,9 +8568,7 @@ async def message_handler(event):
                 my_addr = await get_lightning_address(user_id)
                 my_ln = getattr(my_addr, 'lightning_address', None) if my_addr else None
                 if my_ln and my_ln.lower() == dest.lower():
-                    await event.respond(
-                        "❌ **That's your own Lightning address** — self-payment isn't allowed. "
-                        "Send a different recipient.")
+                    await event.respond(t(user_id, "self_pay_blocked"))
                     return
             except Exception:
                 pass
@@ -8753,9 +8581,9 @@ async def message_handler(event):
             # each have their own explicit amount, keep consistent: always ask amount
             user_steps[user_id] = "batch_amount"
             await event.respond(
-                f"➕ **Recipient {len(ud.get('batch_items', [])) + 1}** — `{dest[:30]}…`\n"
-                f"Type: {kind_hint}\n\n"
-                f"Now send the amount in sats (e.g. `1000`):",
+                t(user_id, "batch_dest_prompt",
+                  n=len(ud.get('batch_items', [])) + 1,
+                  dest=f"{dest[:30]}…", kind=kind_hint),
                 buttons=[[Button.inline(t(user_id, "btn_cancel"), b"more_tools")]])
             return
 
@@ -8763,18 +8591,18 @@ async def message_handler(event):
         elif current_step == "batch_amount":
             amount_txt = text.strip().lstrip('$').replace(',', '')
             if not amount_txt.isdigit():
-                await event.respond("⚠️ Invalid amount. Send sats as a plain number (e.g. `2000`):")
+                await event.respond(t(user_id, "batch_amount_invalid"))
                 return
             sats = int(amount_txt)
             ud = user_data.get(user_id) or {}
             dest = ud.get('batch_pending_dest')
             kind = ud.get('batch_pending_kind')
             if not dest or not kind:
-                await event.respond("❌ Session lost — start Batch Pay again from More Tools.")
+                await event.respond(t(user_id, "batch_session_lost"))
                 user_steps.pop(user_id, None)
                 return
 
-            status = await event.respond("⏳ Preparing payment...")
+            status = await event.respond(t(user_id, "preparing_payment"))
             try:
                 bolt_opts = SendPaymentOptions.BOLT11_INVOICE(prefer_spark=True, completion_timeout_secs=PAYMENT_COMPLETION_TIMEOUT_SECS)
                 fee = 0
@@ -8854,12 +8682,14 @@ async def message_handler(event):
                 total = sum(int(e.get('amount') or 0) for e in items)
                 fee_total = sum(int(e.get('fee') or 0) for e in items)
 
-                lines = [f"✅ **Added!** — {len(items)} payment(s) in batch:\n"]
+                lines = [t(user_id, "batch_added_line", n=len(items))]
                 for i, e in enumerate(items, 1):
                     d = e['dest'] if len(e['dest']) <= 30 else e['dest'][:29] + "…"
-                    lines.append(f"{i}. `{d}` — {e['amount']:,} sats (+⛽{e['fee']:,})")
-                lines.append(f"\n💰 Amounts: {total:,} + ⛽ Fees: {fee_total:,} = **{total + fee_total:,} sats**\n")
-                lines.append("➕ Send next destination to add, or send all now:")
+                    lines.append(t(user_id, "batch_item_line", i=i, dest=d,
+                                   amount=f"{e['amount']:,}", fee=f"{e['fee']:,}"))
+                lines.append(t(user_id, "batch_totals_line", total=f"{total:,}",
+                               fees=f"{fee_total:,}", grand=f"{total + fee_total:,}"))
+                lines.append(t(user_id, "batch_next_hint"))
                 user_steps.pop(user_id, None)
                 try: await status.delete()
                 except Exception: pass
@@ -8871,7 +8701,7 @@ async def message_handler(event):
             except Exception as e:
                 import traceback as _tb
                 logging.error(f"batch prepare: {e}\n{_tb.format_exc()}")
-                await event.respond(f"❌ Failed to prepare: {e}\n\nSend the destination again.",
+                await event.respond(t(user_id, "batch_prep_err", error=str(e)),
                                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"more_tools")]])
             return
 
@@ -8880,20 +8710,22 @@ async def message_handler(event):
             try:
                 amt = int(re.sub(r'[^0-9]', '', text))
             except ValueError:
-                await event.respond("Send a number (sats).")
+                await event.respond(t(user_id, "lnurl_wd_number"))
                 return
             wd = (user_data.get(user_id) or {}).get('withdraw_request')
             if not wd:
-                await event.respond("❌ Withdraw request expired — send the LNURL again.")
+                await event.respond(t(user_id, "lnurl_wd_expired"))
                 user_steps.pop(user_id, None)
                 return
             if amt < wd.min_withdrawable // MSAT_PER_SAT or amt > wd.max_withdrawable // MSAT_PER_SAT:
                 await event.respond(
-                    f"Amount must be between {wd.min_withdrawable // MSAT_PER_SAT:,} and {wd.max_withdrawable // MSAT_PER_SAT:,} sats.")
+                    t(user_id, "lnurl_wd_range",
+                      mn=f"{wd.min_withdrawable // MSAT_PER_SAT:,}",
+                      mx=f"{wd.max_withdrawable // MSAT_PER_SAT:,}"))
                 return
             user_steps.pop(user_id, None)
             user_data.pop(user_id, None)
-            await event.respond("⏳ Claiming...")
+            await event.respond(t(user_id, "claiming_generic"))
             try:
                 sdk = await get_wallet(user_id)
                 from breez_sdk_spark import LnurlWithdrawRequest, LnurlWithdrawRequestDetails
@@ -8910,12 +8742,10 @@ async def message_handler(event):
                     completion_timeout_secs=20,
                 ))
                 await event.respond(
-                    f"✅ **Withdraw claim sent!**\n"
-                    f"💰 {amt:,} sats incoming to your wallet.\n"
-                    f"It completes once the source pays the invoice.")
+                    t(user_id, "lnurl_wd_sent", amt=f"{amt:,}"))
             except Exception as e:
                 logging.error(f"lnurl_withdraw error: {e}")
-                await event.respond(f"❌ Withdraw failed: {e}")
+                await event.respond(t(user_id, "lnurl_wd_failed", error=str(e)))
             return
 
         # Change Lightning address input
@@ -8925,7 +8755,7 @@ async def message_handler(event):
             # Validate username format
             if not username.replace('_', '').isalnum():
                 await event.respond(
-                    "Username can only contain lowercase letters, numbers, and underscores.",
+                    t(user_id, "lnaddr_username_invalid"),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                 )
                 return
@@ -8938,15 +8768,14 @@ async def message_handler(event):
                 del user_steps[user_id]
 
                 await event.respond(
-                    f"**Lightning Address Updated!**\n\n"
-                    f"New Address: `{new_address.lightning_address}`\n"
-                    f"LNURL: `{new_address.lnurl}`",
+                    t(user_id, "lnaddr_updated",
+                      addr=new_address.lightning_address,
+                      lnurl=new_address.lnurl),
                     buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                 )
             except Exception as error:
                 await event.respond(
-                    f"Error: {error}\n\n"
-                    "Username might be taken. Try another one.",
+                    t(user_id, "lnaddr_update_err", error=str(error)),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"settings_back")]]
                 )
 
@@ -8977,17 +8806,15 @@ async def message_handler(event):
                         max_val = from_data.get('max')
                         if min_val and float(min_val) > 0 and amount < float(min_val):
                             await event.reply(
-                                f"❌ Amount too low.\n\n"
-                                f"Minimum: **{min_val} {from_ccy}**\n"
-                                f"You entered: **{amount} {from_ccy}**",
+                                t(user_id, "ff_amount_too_low",
+                                  min=f"{min_val} {from_ccy}", amount=f"{amount} {from_ccy}"),
                                 buttons=[[Button.inline(t(user_id, "btn_try_again"), b"receive_exchange")]]
                             )
                             return
                         if max_val and float(max_val) > 0 and amount > float(max_val):
                             await event.reply(
-                                f"❌ Amount too high.\n\n"
-                                f"Maximum: **{max_val} {from_ccy}**\n"
-                                f"You entered: **{amount} {from_ccy}**",
+                                t(user_id, "ff_amount_too_high",
+                                  max=f"{max_val} {from_ccy}", amount=f"{amount} {from_ccy}"),
                                 buttons=[[Button.inline(t(user_id, "btn_try_again"), b"receive_exchange")]]
                             )
                             return
@@ -8999,22 +8826,19 @@ async def message_handler(event):
                             btc_val = float(receive_btc_raw)
                             receive_btc = f"{btc_val:.8f}".rstrip('0').rstrip('.')
                             receive_sats = int(btc_val * SATS_PER_BTC)
-                            sats_display = f" ({receive_sats:,} sats)"
+                            sats_display = f" ({receive_sats:,} {t(user_id, 'sats_unit')})"
                         except:
                             receive_btc = str(receive_btc_raw)
                             sats_display = ""
 
                         min_max_note = ""
                         if min_val or max_val:
-                            min_max_note = f"Limits: {min_val} - {max_val} {from_ccy}\n"
+                            min_max_note = t(user_id, "ff_limits_line", mn=min_val, mx=max_val, ccy=from_ccy)
 
                         await event.reply(
-                            f"🔄 **Exchange Quote**\n\n"
-                            f"📤 Send: **{amount} {from_ccy}**\n"
-                            f"📥 Receive: **~{receive_btc} BTC**{sats_display}\n"
-                            f"📊 Rate: {rate}\n"
-                            f"{min_max_note}\n"
-                            f"Proceed with this exchange?",
+                            t(user_id, "ff_quote_recv", amount=amount, ccy=from_ccy,
+                              btc=receive_btc, sats=sats_display, rate=rate,
+                              limits=min_max_note),
                             buttons=[
                                 [Button.inline(t(user_id, "btn_create_order"), b"rcv_ex_confirm_yes")],
                                 [Button.inline(t(user_id, "btn_cancel_x"), b"receive_exchange")]
@@ -9025,28 +8849,24 @@ async def message_handler(event):
                         # Log the full response for debugging
                         logging.warning(f"ff.io quote error for {from_ccy}: {price_result}")
                         await event.reply(
-                            f"❌ **Quote Error**\n\n"
-                            f"Currency: `{from_ccy}`\n"
-                            f"Error: {error_msg}\n\n"
-                            f"_This currency may not be available for exchange._",
+                            t(user_id, "ff_quote_err_detail", ccy=from_ccy, error=error_msg),
                             buttons=[[Button.inline(t(user_id, "btn_try_coin"), b"receive_exchange")]]
                         )
                         user_steps.pop(user_id, None)
                 except Exception as e:
                     logging.error(f"ff.io quote exception for {from_ccy}: {e}")
-                    await event.reply(f"Error getting quote: {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"receive_exchange")]])
+                    await event.reply(t(user_id, "ff_quote_get_err", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_back"), b"receive_exchange")]])
                     user_steps.pop(user_id, None)
             except ValueError:
                 await event.reply(
-                    "❌ Invalid amount. Please enter a valid number.\n"
-                    "Example: `0.1` or `100`",
+                    t(user_id, "ff_invalid_amount"),
                     buttons=[[Button.inline(t(user_id, "btn_cancel"), b"receive_exchange")]]
                 )
 
         elif current_step == "ffio_send_address":
             address = text.strip()
             if len(address) < 10:
-                await event.reply("Invalid address. Please try again.")
+                await event.reply(t(user_id, "ff_invalid_address"))
                 return
 
             ud = user_data.get(user_id, {})
@@ -9057,9 +8877,7 @@ async def message_handler(event):
             if tag_type:
                 user_steps[user_id] = "ffio_send_tag"
                 await event.reply(
-                    f"🏷 **{tag_type}**\n\n"
-                    f"Enter **{tag_type}** for your address (if needed):\n"
-                    f"`{address[:30]}...`",
+                    t(user_id, "ff_tag_prompt", tag=tag_type, addr=f"{address[:30]}..."),
                     buttons=[[Button.inline(t(user_id, "btn_skip"), b"ffio_skip_tag"), Button.inline(t(user_id, "btn_cancel"), b"send_exchange")]]
                 )
                 return
@@ -9067,21 +8885,18 @@ async def message_handler(event):
             user_steps[user_id] = "ffio_send_amount"
             to_name = ud.get('ffio_to_name', ud.get('ffio_to_ccy', '?'))
             balance = await get_balance(user_id)
-            balance_display = await format_balance_with_usd(balance)
+            balance_display = await format_balance_with_usd(balance, user_id)
 
             min_sats = ud.get('ffio_min_sats', '')
             max_sats = ud.get('ffio_max_sats', '')
             limit_text = ""
             if min_sats or max_sats:
-                limit_text = f"Min: **{min_sats:,} sats** | Max: **{max_sats:,} sats**\n"
+                limit_text = t(user_id, "ff_sats_limit_line", mn=f"{min_sats:,}", mx=f"{max_sats:,}")
 
             await event.reply(
-                f"**Exchange Lightning BTC -> {to_name}**\n\n"
-                f"Balance: {balance_display}\n"
-                f"Address: `{address[:30]}...`\n"
-                f"{limit_text}\n"
-                f"💰 Enter amount in **sats** to exchange:\n"
-                f"Example: `50000` or `$10`",
+                t(user_id, "ff_amount_prompt_send", name=to_name,
+                  balance=balance_display, addr=f"{address[:30]}...",
+                  limits=limit_text),
                 buttons=[
                     [Button.inline(t(user_id, "btn_send_all"), b"ffio_send_all")],
                     [Button.inline(t(user_id, "btn_cancel"), b"send_exchange")]
@@ -9097,21 +8912,19 @@ async def message_handler(event):
             user_steps[user_id] = "ffio_send_amount"
             to_name = ud.get('ffio_to_name', ud.get('ffio_to_ccy', '?'))
             balance = await get_balance(user_id)
-            balance_display = await format_balance_with_usd(balance)
+            balance_display = await format_balance_with_usd(balance, user_id)
 
             min_sats = ud.get('ffio_min_sats', '')
             max_sats = ud.get('ffio_max_sats', '')
             limit_text = ""
             if min_sats or max_sats:
-                limit_text = f"Min: **{min_sats:,} sats** | Max: **{max_sats:,} sats**\n"
+                limit_text = t(user_id, "ff_sats_limit_line", mn=f"{min_sats:,}", mx=f"{max_sats:,}")
 
             await event.reply(
-                f"**Exchange Lightning BTC -> {to_name}**\n\n"
-                f"Balance: {balance_display}\n"
-                f"Address: `{ud.get('ffio_to_address', '?')[:30]}...`\n"
-                f"{limit_text}\n"
-                f"💰 Enter amount in **sats** to exchange:\n"
-                f"Example: `50000` or `$10`",
+                t(user_id, "ff_amount_prompt_send", name=to_name,
+                  balance=balance_display,
+                  addr=f"{ud.get('ffio_to_address', '?')[:30]}...",
+                  limits=limit_text),
                 buttons=[
                     [Button.inline(t(user_id, "btn_send_all"), b"ffio_send_all")],
                     [Button.inline(t(user_id, "btn_cancel"), b"send_exchange")]
@@ -9141,17 +8954,15 @@ async def message_handler(event):
                 max_sats = ud.get('ffio_max_sats')
                 if min_sats and amount_sats < min_sats:
                     await event.reply(
-                        f"❌ Amount too low.\n\n"
-                        f"Minimum: **{min_sats:,} sats**\n"
-                        f"You entered: **{amount_sats:,} sats**",
+                        t(user_id, "ff_amount_too_low_sats",
+                          min=f"{min_sats:,}", amount=f"{amount_sats:,}"),
                         buttons=[[Button.inline(t(user_id, "btn_try_again"), b"send_exchange")]]
                     )
                     return
                 if max_sats and amount_sats > max_sats:
                     await event.reply(
-                        f"❌ Amount too high.\n\n"
-                        f"Maximum: **{max_sats:,} sats**\n"
-                        f"You entered: **{amount_sats:,} sats**",
+                        t(user_id, "ff_amount_too_high_sats",
+                          max=f"{max_sats:,}", amount=f"{amount_sats:,}"),
                         buttons=[[Button.inline(t(user_id, "btn_try_again"), b"send_exchange")]]
                     )
                     return
@@ -9175,35 +8986,34 @@ async def message_handler(event):
                         if api_min and float(api_min) > 0 and amount_btc < float(api_min):
                             min_s = int(float(api_min) * SATS_PER_BTC)
                             await event.reply(
-                                f"Amount too low.\n\nMinimum: **{min_s:,} sats**\nYou entered: **{amount_sats:,} sats**",
+                                t(user_id, "ff_amount_too_low_api",
+                                  min=f"{min_s:,}", amount=f"{amount_sats:,}"),
                                 buttons=[[Button.inline(t(user_id, "btn_try_again"), b"send_exchange")]]
                             )
                             return
                         if api_max and float(api_max) > 0 and amount_btc > float(api_max):
                             max_s = int(float(api_max) * SATS_PER_BTC)
                             await event.reply(
-                                f"Amount too high.\n\nMaximum: **{max_s:,} sats**\nYou entered: **{amount_sats:,} sats**",
+                                t(user_id, "ff_amount_too_high_api",
+                                  max=f"{max_s:,}", amount=f"{amount_sats:,}"),
                                 buttons=[[Button.inline(t(user_id, "btn_try_again"), b"send_exchange")]]
                             )
                             return
 
-                        amount_display = await format_amount_with_usd(amount_sats)
+                        amount_display = await format_amount_with_usd(amount_sats, user_id)
                         min_max_note = ""
                         if api_min or api_max:
                             try:
                                 mn = f"{int(float(api_min)*SATS_PER_BTC):,}" if api_min else "?"
                                 mx = f"{int(float(api_max)*SATS_PER_BTC):,}" if api_max else "?"
-                                min_max_note = f"Limits: {mn} - {mx} sats\n"
+                                min_max_note = t(user_id, "ff_limits_sats_line", mn=mn, mx=mx)
                             except:
                                 pass
 
                         await event.reply(
-                            f"🔄 **Exchange Quote**\n\n"
-                            f"📤 Send: **{amount_display}**\n"
-                            f"📥 Receive: **~{receive_amount} {to_ccy}**\n"
-                            f"📊 Rate: {rate}\n"
-                            f"{min_max_note}\n"
-                            f"Proceed with this exchange?",
+                            t(user_id, "ff_quote_send", amount=amount_display,
+                              recv=receive_amount, ccy=to_ccy, rate=rate,
+                              limits=min_max_note),
                             buttons=[
                                 [Button.inline(t(user_id, "btn_create_order"), b"snd_ex_confirm_yes")],
                                 [Button.inline(t(user_id, "btn_cancel_x"), b"send_exchange")]
@@ -9211,13 +9021,13 @@ async def message_handler(event):
                         )
                     else:
                         error_msg = price_result.get('msg', 'Unknown error') if price_result else 'API error'
-                        await event.reply(f"Quote Error: {error_msg}", buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
+                        await event.reply(t(user_id, "ff_quote_err_short", error=error_msg), buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
                         user_steps.pop(user_id, None)
                 except Exception as e:
-                    await event.reply(f"❌ Error: {e}", buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
+                    await event.reply(t(user_id, "err_alert_line", error=str(e)), buttons=[[Button.inline(t(user_id, "btn_back"), b"send_exchange")]])
                     user_steps.pop(user_id, None)
             except ValueError:
-                await event.reply("❌ Invalid amount. Enter sats (e.g. `50000`) or USD (e.g. `$10`).")
+                await event.reply(t(user_id, "ff_invalid_amount_sats"))
 
         elif current_step == "receive_memo":
             memo = text.strip()
@@ -9243,7 +9053,7 @@ async def message_handler(event):
                     pass
                 caption_lines = [
                     t(user_id, 'invoice_title'),
-                    f"💰 {t(user_id, 'amount_label')}: {await format_amount_with_usd(pending_amount)}" if pending_amount else t(user_id, 'invoice_no_amount_title'),
+                    f"💰 {t(user_id, 'amount_label')}: {await format_amount_with_usd(pending_amount, user_id)}" if pending_amount else t(user_id, 'invoice_no_amount_title'),
                     f"💬 {t(user_id, 'memo_label')}: {memo}",
                     "",
                     f"`{invoice}`"
@@ -9260,7 +9070,7 @@ async def message_handler(event):
                     ]
                 )
             except Exception as error:
-                await event.respond(f"❌ {error}")
+                await event.respond(t(user_id, "err_bare", error=str(error)))
 
         # Receive amount input (with memo)
         elif current_step == "receive_amount":
@@ -9268,9 +9078,9 @@ async def message_handler(event):
 
             if amount is None:
                 if is_usd:
-                    await event.respond("Unable to convert USD. Please try again or enter amount in sats.")
+                    await event.respond(t(user_id, "usd_conv_fail"))
                 else:
-                    await event.respond("Please enter a valid amount")
+                    await event.respond(t(user_id, "amount_invalid_plain"))
                 return
 
             if amount <= 0:
@@ -9286,7 +9096,7 @@ async def message_handler(event):
                 if user_id in user_data:
                     del user_data[user_id]
 
-                amount_display = await format_amount_with_usd(amount)
+                amount_display = await format_amount_with_usd(amount, user_id)
 
                 # Generate QR code for invoice
                 qr_buffer = generate_qr_code(invoice)
@@ -9295,16 +9105,12 @@ async def message_handler(event):
                     event.chat_id,
                     qr_buffer,
                     force_document=False,
-                    caption=(
-                        f"📥 **Your Invoice**\n\n"
-                        f"💰 Amount: {amount_display}\n"
-                        f"💬 Memo: {memo}\n\n"
-                        f"`{invoice}`"
-                    ),
+                    caption=t(user_id, "invoice_caption",
+                               amount=amount_display, memo=memo, invoice=invoice),
                     buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
                 )
             except Exception as error:
-                await event.respond(f"❌ Error: {error}")
+                await event.respond(t(user_id, "err_alert_line", error=str(error)))
 
         # Receive amount input (without memo)
         elif current_step == "receive_amount_no_memo":
@@ -9312,9 +9118,9 @@ async def message_handler(event):
 
             if amount is None:
                 if is_usd:
-                    await event.respond("Unable to convert USD. Please try again or enter amount in sats.")
+                    await event.respond(t(user_id, "usd_conv_fail"))
                 else:
-                    await event.respond("Please enter a valid amount")
+                    await event.respond(t(user_id, "amount_invalid_plain"))
                 return
 
             if amount <= 0:
@@ -9335,7 +9141,7 @@ async def message_handler(event):
                     else:
                         user_data[user_id].pop('pending_memo', None)
 
-                amount_display = await format_amount_with_usd(amount)
+                amount_display = await format_amount_with_usd(amount, user_id)
 
                 # Generate QR code for invoice
                 qr_buffer = generate_qr_code(invoice)
@@ -9359,7 +9165,7 @@ async def message_handler(event):
                     ]
                 )
             except Exception as error:
-                await event.respond(f"❌ {error}")
+                await event.respond(t(user_id, "err_bare", error=str(error)))
 
         # ==================== SEND: Parse Invoice ====================
         elif current_step == "send_invoice":
@@ -9369,9 +9175,7 @@ async def message_handler(event):
                 resolved_user_info = None
                 if text.startswith('@'):
                     processing_msg = await event.respond(
-                        f"🔍 **Resolving Username**\n\n"
-                        f"👤 `{text}`\n\n"
-                        f"⏳ Please wait..."
+                        t(user_id, "resolving_user", txt=text)
                     )
                     lightning_address, resolved_user_info = await resolve_username(text)
                     text = lightning_address
@@ -9445,18 +9249,14 @@ async def message_handler(event):
                     }
                     if processing_msg:
                         await processing_msg.edit(
-                            f"💸 **LNURL-Withdraw detected**\n\n"
-                            f"You can claim this to your wallet.\n"
-                            f"Range: {min_sats:,} – {max_sats:,} sats\n\n"
-                            f"Send the amount to withdraw (in sats):",
+                            t(user_id, "lnurl_wd_detected",
+                              mn=f"{min_sats:,}", mx=f"{max_sats:,}"),
                             buttons=[[Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]]
                         )
                     else:
                         await event.respond(
-                            f"💸 **LNURL-Withdraw detected**\n\n"
-                            f"You can claim this to your wallet.\n"
-                            f"Range: {min_sats:,} – {max_sats:,} sats\n\n"
-                            f"Send the amount to withdraw (in sats):",
+                            t(user_id, "lnurl_wd_detected",
+                              mn=f"{min_sats:,}", mx=f"{max_sats:,}"),
                             buttons=[[Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]]
                         )
                     user_steps[user_id] = "lnurl_withdraw_amount"
@@ -9471,13 +9271,8 @@ async def message_handler(event):
                         'lnurl_auth_request': details,
                         'payment_type': 'lnurl_auth'
                     }
-                    msg = (
-                        f"🔐 **LNURL-Auth**\n\n"
-                        f"🌐 Domain: `{domain}`\n"
-                        f"⚡ Action: `{action}`\n\n"
-                        f"Sign in with your wallet key? No funds move — "
-                        f"a domain-specific key is used (can't touch your balance)."
-                    )
+                    msg = t(user_id, "lnurl_auth_card",
+                            domain=domain, action=action)
                     auth_btns = [[Button.inline(t(user_id, "btn_confirm"), b"lnurlauth_ok"),
                                   Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]]
                     if processing_msg:
@@ -9509,7 +9304,7 @@ async def message_handler(event):
                     hint = ""
                     if usd_rate:
                         sats_per_dollar = usd_to_sats(1, usd_rate)
-                        hint = f"\n\n💡 $1 ≈ {sats_per_dollar:,} sats"
+                        hint = t(user_id, "usd_hint_approx", one=f"{sats_per_dollar:,}")
 
                     # Quick amount buttons + withdraw all
                     buttons = [
@@ -9532,56 +9327,39 @@ async def message_handler(event):
 
                         # Show bot status
                         if has_started:
-                            bot_status = "✅ Bot started"
+                            bot_status = t(user_id, "bot_started")
                         else:
-                            bot_status = "⚠️ Bot not started"
+                            bot_status = t(user_id, "bot_not_started")
 
-                        resolved_text = (
-                            f"✅ **Sending to:**\n"
-                            f"👤 @{ru['username']}\n"
-                            f"📛 {ru['display_name']}\n"
-                            f"🆔 `{ru['id']}`\n"
-                            f"📌 Type: {ru['type']}\n"
-                            f"🤖 {bot_status}\n\n"
-                        )
+                        resolved_text = t(
+                            user_id, "send_to_block",
+                            username=ru['username'],
+                            name=ru['display_name'],
+                            uid=ru['id'], type=ru['type'],
+                            status=bot_status)
                         # Add tips based on user type and bot status
                         if ru['is_channel'] or ru['is_group']:
-                            tips_text = (
-                                "⚠️ **Important:**\n"
-                                "• This is a **group/channel** wallet\n"
-                                "• Admins won't be notified automatically\n"
-                                "• Please inform the admin about this transfer\n\n"
-                            )
+                            tips_text = t(user_id, "tips_group_wallet")
                         elif not has_started:
-                            tips_text = (
-                                "⚠️ **Recipient hasn't started the bot!**\n"
-                                "• They will **NOT** receive a notification\n"
-                                "• The funds will be safe in their wallet\n"
-                                "• Please tell them to start the bot\n\n"
-                            )
+                            tips_text = t(user_id, "tips_not_started")
                         # If has_started is True, no tips needed
 
                     # Build amount instruction
-                    amount_instruction = (
-                        "**Choose or type amount:**\n"
-                        "• Type number: `5000` = 5000 sats\n"
-                        "• Use $ prefix: `$5` = ~$5 in sats\n"
-                        "• Or tap a quick button below"
-                    )
+                    amount_instruction = t(user_id, "send_choose_amount")
 
                     # Edit processing message or send new one
                     if processing_msg:
                         await processing_msg.edit(
-                            f"💵 **Enter Amount**\n\n"
-                            f"{resolved_text}"
-                            f"{tips_text}"
-                            f"{amount_instruction}{hint}",
+                            t(user_id, "send_amount_prompt",
+                              resolved=resolved_text, tips=tips_text,
+                              instruction=amount_instruction, hint=hint),
                             buttons=buttons
                         )
                     else:
                         await event.respond(
-                            f"💵 **Enter Amount**\n\n"
-                            f"{amount_instruction}{hint}",
+                            t(user_id, "send_amount_prompt", resolved="",
+                              tips="", instruction=amount_instruction,
+                              hint=hint),
                             buttons=buttons
                         )
                 else:
@@ -9597,17 +9375,7 @@ async def message_handler(event):
 
             except Exception as error:
                 # Edit processing message with error or send new one
-                error_msg = (
-                    f"❌ **Invalid Input**\n\n"
-                    f"Error: {error}\n\n"
-                    f"Please send a valid:\n"
-                    f"• Lightning Invoice (lnbc...)\n"
-                    f"• Lightning Address (user@domain.com)\n"
-                    f"• Telegram Username (@username)\n"
-                    f"• Bitcoin Address (bc1...)\n"
-                    f"• LNURL\n\n"
-                    f"Or cancel:"
-                )
+                error_msg = t(user_id, "invalid_input_card", error=str(error))
                 if processing_msg:
                     await processing_msg.edit(
                         error_msg,
@@ -9629,8 +9397,7 @@ async def message_handler(event):
             if amount is None:
                 if is_usd:
                     await event.respond(
-                        "❌ Unable to convert USD. Please try again or enter amount in sats.\n\n"
-                        "Try again or cancel:",
+                        t(user_id, "usd_conv_fail_retry"),
                         buttons=[
                             [Button.inline(t(user_id, "btn_wd_all"), b"send_withdraw_all")],
                             [Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]
@@ -9638,8 +9405,7 @@ async def message_handler(event):
                     )
                 else:
                     await event.respond(
-                        "❌ Please enter a valid number in sats or $USD\n\n"
-                        "Try again or cancel:",
+                        t(user_id, "amount_invalid_retry"),
                         buttons=[
                             [Button.inline(t(user_id, "btn_wd_all"), b"send_withdraw_all")],
                             [Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]
@@ -9666,8 +9432,9 @@ async def message_handler(event):
                 if payment_type == 'lnurl':
                     if amount < data['min_sats'] or amount > data['max_sats']:
                         await event.respond(
-                            f"⚠️ Amount must be between {data['min_sats']:,} and {data['max_sats']:,} sats\n\n"
-                            f"Please enter a valid amount:",
+                            t(user_id, "lnurl_range_err",
+                              mn=f"{data['min_sats']:,}",
+                              mx=f"{data['max_sats']:,}"),
                             buttons=[
                                 [Button.inline(t(user_id, "btn_wd_all"), b"send_withdraw_all")],
                                 [Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]
@@ -9676,7 +9443,7 @@ async def message_handler(event):
                         return
 
                     try:
-                        res = await event.respond("⚡ Calculating fees...")
+                        res = await event.respond(t(user_id, "calc_loading"))
                         prepare_response, fee_sats = await prepare_lnurl_pay(
                             user_id, data['pay_request'], amount
                         )
@@ -9687,18 +9454,16 @@ async def message_handler(event):
                         total = amount + fee_sats
 
                         # Format with USD
-                        amount_display = await format_amount_with_usd(amount)
-                        fee_display = await format_amount_with_usd(fee_sats)
-                        total_display = await format_amount_with_usd(total)
+                        amount_display = await format_amount_with_usd(amount, user_id)
+                        fee_display = await format_amount_with_usd(fee_sats, user_id)
+                        total_display = await format_amount_with_usd(total, user_id)
 
                         _q = (user_data.get(user_id) or {}).get('send_queue') or []
-                        _q_txt = (build_queue_text(_q)[0] + "\n\n" + "─" * 10 + "\n🔹 **New payment:**\n") if _q else ""
+                        _q_txt = (build_queue_text(_q, user_id)[0] + "\n\n" + "─" * 10 + "\n" + t(user_id, "queue_new_payment") + "\n") if _q else ""
                         await res.edit(
-                            _q_txt + f"📋 **Payment Summary (LNURL)**\n\n"
-                            f"💰 Amount: {amount_display}\n"
-                            f"⚡ Fee: {fee_display}\n"
-                            f"💳 Total: {total_display}\n\n"
-                            f"Confirm payment?",
+                            _q_txt + t(user_id, "pay_summary_lnurl",
+                                       amount=amount_display, fee=fee_display,
+                                       total=total_display),
                             buttons=[
                                 [
                                     Button.inline(t(user_id, "btn_confirm"), b"confirm_payment_yes"),
@@ -9709,8 +9474,7 @@ async def message_handler(event):
                         del user_steps[user_id]
                     except Exception as error:
                         await event.respond(
-                            f"❌ Error preparing payment:\n{error}\n\n"
-                            f"Please try again or cancel:",
+                            t(user_id, "prep_err_retry", error=str(error)),
                             buttons=[
                                 [Button.inline(t(user_id, "btn_wd_all"), b"send_withdraw_all")],
                                 [Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]
@@ -9720,7 +9484,7 @@ async def message_handler(event):
                 # Onchain Payment
                 elif payment_type == 'onchain':
                     try:
-                        res = await event.respond("⛓️ Calculating onchain fees...")
+                        res = await event.respond(t(user_id, "onchain_fees_loading"))
                         user_data[user_id]['amount'] = amount
                         prepare_response, _, _ = await prepare_payment(user_id, data['invoice'], amount)
 
@@ -9737,16 +9501,12 @@ async def message_handler(event):
                         }
 
                         # Format with USD
-                        amount_display = await format_amount_with_usd(amount)
+                        amount_display = await format_amount_with_usd(amount, user_id)
 
                         await res.edit(
-                            f"📋 **Onchain Payment Summary**\n\n"
-                            f"💰 Amount: {amount_display}\n\n"
-                            f"⚡ **Fee Options:**\n"
-                            f"🐢 Slow: {slow_fee:,} sats\n"
-                            f"🚗 Medium: {medium_fee:,} sats\n"
-                            f"🚀 Fast: {fast_fee:,} sats\n\n"
-                            f"Choose confirmation speed:",
+                            t(user_id, "onchain_fee_options",
+                              amount=amount_display, slow=f"{slow_fee:,}",
+                              med=f"{medium_fee:,}", fast=f"{fast_fee:,}"),
                             buttons=[
                                 [
                                     Button.inline(t(user_id, "btn_fee_slow"), b"onchain_speed_slow"),
@@ -9759,8 +9519,7 @@ async def message_handler(event):
                         del user_steps[user_id]
                     except Exception as error:
                         await event.respond(
-                            f"❌ Error calculating fees:\n{error}\n\n"
-                            f"Please try again or cancel:",
+                            t(user_id, "fee_calc_err", error=str(error)),
                             buttons=[
                                 [Button.inline(t(user_id, "btn_wd_all"), b"send_withdraw_all")],
                                 [Button.inline(t(user_id, "btn_cancel"), b"back_to_menu")]
@@ -9783,7 +9542,7 @@ async def message_handler(event):
     except Exception as error:
         logging.error(f"Message handler error: {error}")
         await event.respond(
-            f"Error: {error}",
+            t(user_id, "err_alert_line", error=str(error)),
             buttons=[[Button.inline(t(user_id, "btn_back_menu"), b"back_to_menu")]]
         )
         if user_id in user_steps:
@@ -9798,7 +9557,7 @@ async def show_contacts(event, edit=False):
     try:
         contacts = await list_user_contacts(user_id)
     except Exception as e:
-        msg = f"❌ Could not load contacts: {e}"
+        msg = t(user_id, "contacts_load_err", error=str(e))
         btns = _row_back_menu(user_id)
         if edit:
             try:
@@ -9817,14 +9576,13 @@ async def show_contacts(event, edit=False):
 
     btns = []
     if not cmap:
-        msg = ("📒 **Address Book (empty)**\n\nNo contacts yet.\n\n"
-               "Add one with:\n`/addcontact <name> <address-or-invoice>`")
+        msg = t(user_id, "contacts_empty")
     else:
-        lines = ["📒 **Address Book**\n"]
+        lines = [t(user_id, "contacts_title")]
         for idx, c in cmap.items():
             ident = c['identifier']
             shown = (ident[:24] + '…') if len(ident) > 25 else ident
-            lines.append(f"• **{c['name']}** — `{shown}`")
+            lines.append(t(user_id, "contacts_item", name=c['name'], ident=shown))
             btns.append([
                 Button.inline(f"📤 {c['name']}", f"contactpay_{idx}".encode()),
                 Button.inline("🗑️", f"contactdel_{idx}".encode()),
@@ -9893,25 +9651,26 @@ async def token_audit_handler(event):
 async def fees_handler(event):
     """Show recommended on-chain network fees."""
     try:
-        await event.respond("⏳ Fetching network fees...")
+        await event.respond(t(event.sender_id, "fees_loading"))
         fees = await get_recommended_fees(event.sender_id)
-        await event.respond(_format_fees(fees),
+        await event.respond(_format_fees(fees, event.sender_id),
                             buttons=[[Button.inline(t(event.sender_id, "btn_back_menu"), b"back_to_menu")]])
     except Exception as e:
-        await event.respond(f"❌ Could not fetch fees: {e}")
+        await event.respond(t(event.sender_id, "fees_failed", error=str(e)))
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_private, pattern=r'/sync'))
 async def sync_handler(event):
     """Force a wallet sync."""
     try:
-        await event.respond("🔄 Syncing wallet...")
+        await event.respond(t(event.sender_id, "syncing_wallet"))
         info = await sync_user_wallet(event.sender_id)
         await event.respond(
-            f"✅ Wallet synced.\n💰 Balance: **{getattr(info, 'balance_sats', 0):,} sats**",
+            t(event.sender_id, "sync_done",
+              balance=f"{getattr(info, 'balance_sats', 0):,}"),
             buttons=[[Button.inline(t(event.sender_id, "btn_back_menu"), b"back_to_menu")]])
     except Exception as e:
-        await event.respond(f"❌ Sync failed: {e}")
+        await event.respond(t(event.sender_id, "sync_failed", error=str(e)))
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_private, pattern=r'/signmsg(?:\s+(.+))?'))
@@ -9920,19 +9679,16 @@ async def signmsg_handler(event):
     try:
         message = (event.pattern_match.group(1) or '').strip()
         if not message:
-            await event.respond("ℹ️ Usage: `/signmsg <message>`\nExample: `/signmsg hello world`")
+            await event.respond(t(event.sender_id, "signmsg_usage"))
             return
-        status = await event.respond("✍️ Signing...")
+        status = await event.respond(t(event.sender_id, "signing_msg"))
         resp = await sign_message_with_wallet(event.sender_id, message)
         await status.edit(
-            "✅ **Message signed**\n\n"
-            f"📝 Message: `{message}`\n"
-            f"🔑 Pubkey: `{resp.pubkey}`\n"
-            f"🔏 Signature: `{resp.signature}`\n\n"
-            "Verify with `/verifymsg <pubkey> <signature> <message>`.",
+            t(event.sender_id, "signmsg_done", msg=message,
+              pubkey=resp.pubkey, sig=resp.signature),
             buttons=[[Button.inline(t(event.sender_id, "btn_back_menu"), b"back_to_menu")]])
     except Exception as e:
-        await event.respond(f"❌ Signing failed: {e}")
+        await event.respond(t(event.sender_id, "signmsg_failed", error=str(e)))
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_private, pattern=r'/verifymsg\s+(\S+)\s+(\S+)\s+(.+)'))
@@ -9943,12 +9699,14 @@ async def verifymsg_handler(event):
         signature = event.pattern_match.group(2)
         message = event.pattern_match.group(3).strip()
         resp = await check_message_with_wallet(event.sender_id, message, pubkey, signature)
-        verdict = "✅ **VALID** — signature matches." if resp.is_valid else "❌ **INVALID** — does not match."
+        verdict = (t(event.sender_id, "verify_valid") if resp.is_valid
+                  else t(event.sender_id, "verify_invalid"))
         await event.respond(
-            f"{verdict}\n\n📝 Message: `{message}`\n🔑 Pubkey: `{pubkey}`",
+            t(event.sender_id, "verify_result", verdict=verdict,
+              msg=message, pubkey=pubkey),
             buttons=[[Button.inline(t(event.sender_id, "btn_back_menu"), b"back_to_menu")]])
     except Exception as e:
-        await event.respond(f"❌ Verification failed: {e}\nUsage: `/verifymsg <pubkey> <signature> <message>`")
+        await event.respond(t(event.sender_id, "verify_failed", error=str(e)))
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_private, pattern=r'/buy'))
@@ -9957,11 +9715,11 @@ async def buy_handler(event):
     try:
         url = await buy_bitcoin_url(event.sender_id)
         await event.respond(
-            f"🟧 **Buy Bitcoin**\n\nOpen the on-ramp here:\n\n{url}",
+            t(event.sender_id, "buy_card", url=url),
             buttons=[[Button.inline(t(event.sender_id, "btn_back_menu"), b"back_to_menu")]],
             link_preview=False)
     except Exception as e:
-        await event.respond(f"❌ Could not create buy link: {e}")
+        await event.respond(t(event.sender_id, "buy_failed", error=str(e)))
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_private, pattern=r'/contacts'))
@@ -9977,15 +9735,16 @@ async def add_contact_handler(event):
         name = event.pattern_match.group(1).strip()
         identifier = event.pattern_match.group(2).strip()
         if len(name) > 48:
-            await event.respond("❌ Name too long (max 48 chars).")
+            await event.respond(t(event.sender_id, "contact_name_long"))
             return
         contact = await add_user_contact(event.sender_id, name, identifier)
         await event.respond(
-            f"✅ **Contact saved**\n\n• **{contact.name}** — `{contact.payment_identifier}`",
+            t(event.sender_id, "contact_saved", name=contact.name,
+              ident=contact.payment_identifier),
             buttons=[[Button.inline(t(event.sender_id, "btn_view_contacts"), b"contacts")],
                      [Button.inline(t(event.sender_id, "btn_back_menu"), b"back_to_menu")]])
     except Exception as e:
-        await event.respond(f"❌ Could not add contact: {e}")
+        await event.respond(t(event.sender_id, "contact_add_failed", error=str(e)))
 
 
 @client.on(events.NewMessage(pattern=r'(?i)/zap_balance(?:@\w+)?\b'))
@@ -10002,7 +9761,7 @@ async def balance_handler(event):
     if is_anonymous:
         await init(user_id)
         balance = await get_balance(user_id)
-        balance_display = await format_balance_with_usd(balance)
+        balance_display = await format_balance_with_usd(balance, user_id)
         await event.reply(t(user_id, "balance_anon_text", balance=balance_display))
         return
 
@@ -10042,21 +9801,18 @@ async def debug_handler(event):
     usd_rate = await get_usd_rate()
 
     # Format volumes with USD
+    unit = t(event.sender_id, "sats_unit")
     if usd_rate:
         total_in_usd = sats_to_usd(total_in, usd_rate)
         total_out_usd = sats_to_usd(total_out, usd_rate)
-        in_display = f"{total_in:,} sats (~${total_in_usd:,.2f})"
-        out_display = f"{total_out:,} sats (~${total_out_usd:,.2f})"
+        in_display = f"{total_in:,} {unit} (~${total_in_usd:,.2f})"
+        out_display = f"{total_out:,} {unit} (~${total_out_usd:,.2f})"
     else:
-        in_display = f"{total_in:,} sats"
-        out_display = f"{total_out:,} sats"
+        in_display = f"{total_in:,} {unit}"
+        out_display = f"{total_out:,} {unit}"
 
-    stats_msg = (
-        f"📊 **Bot Statistics**\n\n"
-        f"👥 **Total Users:** {total_users}\n\n"
-        f"📥 **Total Volume In:** {in_display}\n"
-        f"📤 **Total Volume Out:** {out_display}"
-    )
+    stats_msg = t(event.sender_id, "debug_stats", users=total_users,
+                  vin=in_display, vout=out_display)
 
     await event.reply(stats_msg)
 
@@ -10066,17 +9822,7 @@ async def debug_handler(event):
 async def zap_help_handler(event):
     """Show zap usage when /zap is typed with no arguments (e.g. tapped from the
     Telegram command menu, which also appends @BotUsername)."""
-    await event.reply(
-        "⚡ **How to Zap:**\n\n"
-        "Reply to someone's message with:\n"
-        "`/zap <amount>`\n\n"
-        "Or mention a user:\n"
-        "`/zap <amount> @username [message]`\n\n"
-        "**Examples:**\n"
-        "• `/zap 1000`\n"
-        "• `/zap $5`\n"
-        "• `/zap 21 @alice Great job!`"
-    )
+    await event.reply(t(event.sender_id, "zap_usage"))
 
 
 @client.on(events.NewMessage(pattern=r'(?i)/zap(?:@\w+)?\s+(\$?\d+(?:\.\d+)?)\s*(?:@(\w+))?(?:\s+(.+))?'))
@@ -10092,7 +9838,7 @@ async def tip_handler(event):
     - /zap 21 @alice You're awesome! - Send 21 sats with message
     """
     if event.is_private:
-        await event.reply("⚡ Zap command only works in groups!")
+        await event.reply(t(event.sender_id, "zap_groups_only"))
         return
 
     try:
@@ -10116,7 +9862,7 @@ async def tip_handler(event):
         sender_id, is_anonymous = get_sender_info(event)
 
         if not sender_id:
-            await event.reply("❌ Could not identify sender.")
+            await event.reply(t(sender_id, "err_no_sender"))
             return
 
         # Quick basic validation first
@@ -10125,10 +9871,10 @@ async def tip_handler(event):
             amount_display_temp = f"${amount_str[1:]}"
         else:
             amount = int(amount_str)
-            amount_display_temp = f"{amount:,} sats"
+            amount_display_temp = f"{amount:,} {t(sender_id, 'sats_unit')}"
 
         if amount <= 0:
-            await event.reply("❌ Amount must be greater than 0")
+            await event.reply(t(sender_id, "zap_amount_gt0"))
             return
 
         # Create zap ID and store BASIC data immediately (before sending message)
@@ -10148,7 +9894,7 @@ async def tip_handler(event):
 
         # Send INSTANT loading message with cancel button
         _msg = await event.reply(
-            "⚡ Zapping...",
+            t(sender_id, "zap_loading"),
             buttons=[
                 Button.inline(t(sender_id, "btn_cancel_x"), f"zap_cancel_{zap_id}".encode())
             ]
@@ -10162,7 +9908,7 @@ async def tip_handler(event):
 
     except Exception as error:
         logging.error(f"Zap error: {error}")
-        await event.reply(f"❌ Zap failed: {error}")
+        await event.reply(t(event.sender_id, "zap_failed_reason", reason=error))
 
 
 async def add_zap_reaction(chat_id, message_id):
@@ -10180,6 +9926,56 @@ async def add_zap_reaction(chat_id, message_id):
         return False
 
 
+async def _zap_mention(client, user, uid, plain=False):
+    """v32 (zap display fix): best From/To mention for zap_announce/zap_success.
+
+    Resolution order:
+      1. active @username on the entity we already hold;
+      2. the Telegram multi-username vector (.usernames) — the FIRST entry
+         is the primary active username (this is what leaked raw numeric
+         ids before: .username None while the vector had entries);
+      3. ONE fresh read-only client.get_entity(uid) re-check (5s guard) —
+         cached group entities can predate a user's username; never
+         touches SDK/wallet state;
+      4. clickable [first_name](tg://user?id=...) mention — zap messages
+         render with the client's default Markdown parse mode (the
+         templates already use **bold**), so tg://user links resolve;
+      5. plain #<id> / str(<id>).
+
+    plain=True is for non-markdown sinks (the invoice memo): same
+    username resolution, but never emits link syntax — @username or the
+    bare numeric id, byte-identical to the pre-fix memo.
+    """
+    def _primary_username(entity):
+        vector = getattr(entity, 'usernames', None)
+        if vector:
+            name = getattr(vector[0], 'username', None)  # first = primary
+            if name:
+                return name
+        return None
+
+    entity = user
+    username = getattr(entity, 'username', None) if entity is not None else None
+    primary = _primary_username(entity)
+    if not username and not primary:
+        try:
+            entity = await asyncio.wait_for(client.get_entity(uid), timeout=5)
+            username = getattr(entity, 'username', None)
+            primary = _primary_username(entity)
+        except Exception:
+            pass  # keep whatever the original entity still offers below
+    if username:
+        return f'@{username}'
+    if primary:
+        return f'@{primary}'
+    first_name = getattr(entity, 'first_name', None) if entity is not None else None
+    if first_name and not plain:
+        return f'[{_md_escape(str(first_name))}](tg://user?id={uid})'
+    if not first_name and not plain:
+        return f'#{uid}'
+    return str(uid)
+
+
 # Full zap processing in background (all slow operations here)
 async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_str, username, message, amount_display_temp):
     """Process all zap operations in background"""
@@ -10187,7 +9983,7 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
         # Check if cancelled during initializing phase
         if sender_id in pending_zap_confirmations and pending_zap_confirmations[sender_id].get('status') == 'cancelled':
             try:
-                await msg.edit("❌ Zap cancelled.", buttons=None)
+                await msg.edit(t(sender_id, "zap_cancelled"), buttons=None)
             except:
                 pass  # Message already edited by cancel handler
             del pending_zap_confirmations[sender_id]
@@ -10201,25 +9997,25 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
             usd_amount = float(amount_str[1:])
             if not usd_rate:
                 try:
-                    await msg.edit("❌ Unable to get USD rate. Please try with sats amount.", buttons=None)
+                    await msg.edit(t(sender_id, "zap_no_usd_rate"), buttons=None)
                 except:
                     pass
                 return
             amount = usd_to_sats(usd_amount, usd_rate)
-            amount_display = f"${usd_amount} ({amount:,} sats)"
+            amount_display = f"${usd_amount} ({amount:,} {t(sender_id, 'sats_unit')})"
         else:
             # Sats amount
             amount = int(amount_str)
             if usd_rate:
                 usd_value = sats_to_usd(amount, usd_rate)
-                amount_display = f"{amount:,} sats (~${usd_value:.2f})"
+                amount_display = f"{amount:,} {t(sender_id, 'sats_unit')} (~${usd_value:.2f})"
             else:
-                amount_display = f"{amount:,} sats"
+                amount_display = f"{amount:,} {t(sender_id, 'sats_unit')}"
 
         # Check if cancelled after amount parsing
         if sender_id in pending_zap_confirmations and pending_zap_confirmations[sender_id].get('status') == 'cancelled':
             try:
-                await msg.edit("❌ Zap cancelled.", buttons=None)
+                await msg.edit(t(sender_id, "zap_cancelled"), buttons=None)
             except:
                 pass  # Message already edited by cancel handler
             del pending_zap_confirmations[sender_id]
@@ -10236,7 +10032,7 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
                 receiver_name = f"@{username}"
             except Exception as error:
                 try:
-                    await msg.edit(f"❌ User @{username} not found!", buttons=None)
+                    await msg.edit(t(sender_id, "zap_target_not_found", username=username), buttons=None)
                 except:
                     pass
                 return
@@ -10247,24 +10043,18 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
             receiver_id, _ = get_sender_info(reply_msg)
             if not receiver_id:
                 try:
-                    await msg.edit("❌ Cannot zap this message (unknown sender).", buttons=None)
+                    await msg.edit(t(sender_id, "zap_unknown_target"), buttons=None)
                 except:
                     pass
                 return
             if reply_msg.sender:
-                receiver_name = f"@{reply_msg.sender.username}" if reply_msg.sender.username else str(receiver_id)
+                receiver_name = await _zap_mention(client, reply_msg.sender, receiver_id)
             else:
                 receiver_name = str(receiver_id)
         else:
             try:
                 await msg.edit(
-                    "⚡ **How to Zap:**\n\n"
-                    "Reply to someone's message or use:\n"
-                    "`/zap <amount> @username [message]`\n\n"
-                    "**Examples:**\n"
-                    "• `/zap 1000 @john`\n"
-                    "• `/zap $5 @alice`\n"
-                    "• `/zap 21 @bob Great job!`",
+                    t(sender_id, "zap_usage_reply"),
                     buttons=None
                 )
             except:
@@ -10273,7 +10063,7 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
 
         if sender_id == receiver_id:
             try:
-                await msg.edit("❌ You can't zap yourself!", buttons=None)
+                await msg.edit(t(sender_id, "zap_self"), buttons=None)
             except:
                 pass
             return
@@ -10281,7 +10071,7 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
         # Check if cancelled after receiver determination
         if sender_id in pending_zap_confirmations and pending_zap_confirmations[sender_id].get('status') == 'cancelled':
             try:
-                await msg.edit("❌ Zap cancelled.", buttons=None)
+                await msg.edit(t(sender_id, "zap_cancelled"), buttons=None)
             except:
                 pass  # Message already edited by cancel handler
             del pending_zap_confirmations[sender_id]
@@ -10299,7 +10089,7 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
         if balance < amount:
             try:
                 await msg.edit(
-                    f"❌ **Insufficient balance!**",
+                    t(sender_id, "zap_insuff_balance"),
                     buttons=None
                 )
             except:
@@ -10309,34 +10099,39 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
         # Check if cancelled after wallet operations
         if sender_id in pending_zap_confirmations and pending_zap_confirmations[sender_id].get('status') == 'cancelled':
             try:
-                await msg.edit("❌ Zap cancelled.", buttons=None)
+                await msg.edit(t(sender_id, "zap_cancelled"), buttons=None)
             except:
                 pass  # Message already edited by cancel handler
             del pending_zap_confirmations[sender_id]
             return
 
         # Get sender name
+        sender_memo_name = None
         if is_anonymous:
-            sender_name = "Anonymous"
+            sender_name = t(sender_id, "zap_anon_name")
             if event.sender and hasattr(event.sender, 'title') and event.sender.title:
                 sender_name = f"📢 {event.sender.title}"
         else:
             if event.sender:
-                sender_name = f"@{event.sender.username}" if event.sender.username else str(sender_id)
+                sender_name = await _zap_mention(client, event.sender, sender_id)
             else:
                 sender_name = str(sender_id)
+            # Invoice memos are not message-rendered: same resolution but no
+            # markdown link syntax (byte-identical to the pre-fix memo).
+            sender_memo_name = await _zap_mention(client, event.sender, sender_id, plain=True)
 
         # Prepare description for the invoice (include message if provided)
         # Sanitize to remove non-printable characters (like ZWNJ in Persian)
+        sender_for_memo = sender_memo_name if sender_memo_name is not None else sender_name
         if message:
-            description = sanitize_memo(f"Zap from {sender_name}: {message}")
+            description = sanitize_memo(f"Zap from {sender_for_memo}: {message}")
         else:
-            description = sanitize_memo(f"Zap from {sender_name}")
+            description = sanitize_memo(f"Zap from {sender_for_memo}")
 
         # FINAL CHECK before starting payment - if cancelled, don't proceed
         if sender_id in pending_zap_confirmations and pending_zap_confirmations[sender_id].get('status') == 'cancelled':
             try:
-                await msg.edit("❌ Zap cancelled.", buttons=None)
+                await msg.edit(t(sender_id, "zap_cancelled"), buttons=None)
             except:
                 pass  # Message already edited by cancel handler
             del pending_zap_confirmations[sender_id]
@@ -10362,9 +10157,7 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
 
         # Edit with full details
         await msg.edit(
-            f"⚡ **Zapping {amount_display}...**\n\n"
-            f"👤 From: {sender_name}\n"
-            f"👤 To: {receiver_name}",
+            t(sender_id, "zap_announce", amount=amount_display, sender=sender_name, receiver=receiver_name),
             buttons=[
                 Button.inline(t(sender_id, "btn_cancel_x"), f"zap_cancel_{zap_id}".encode())
             ]
@@ -10377,7 +10170,7 @@ async def process_zap_full(zap_id, msg, event, sender_id, is_anonymous, amount_s
     except Exception as error:
         logging.error(f"Zap processing error: {error}")
         try:
-            await msg.edit(f"❌ Zap failed: {error}", buttons=None)
+            await msg.edit(t(sender_id, "zap_failed_reason", reason=error), buttons=None)
         except:
             pass
 
@@ -10400,9 +10193,7 @@ async def remove_cancel_button_after_delay(zap_id, msg, amount_display, sender_n
         if zap_data.get('status') == 'processing':
             try:
                 await msg.edit(
-                    f"⚡ **Zapping {amount_display}...**\n\n"
-                    f"👤 From: {sender_name}\n"
-                    f"👤 To: {receiver_name}",
+                    t(zap_owner_id, "zap_announce", amount=amount_display, sender=sender_name, receiver=receiver_name),
                     buttons=None
                 )
             except:
@@ -10423,7 +10214,7 @@ async def process_zap_payment(zap_id, msg, sender_id, receiver_id, amount, amoun
                 break
 
         if not zap_data:
-            await msg.edit("❌ Zap data not found", buttons=None)
+            await msg.edit(t(sender_id, "zap_data_missing"), buttons=None)
             return
 
         # Small delay to allow quick cancellation (0.5 seconds)
@@ -10431,7 +10222,7 @@ async def process_zap_payment(zap_id, msg, sender_id, receiver_id, amount, amoun
 
         # Check if cancelled before starting payment
         if zap_owner_id in pending_zap_confirmations and pending_zap_confirmations[zap_owner_id].get('status') == 'cancelled':
-            await msg.edit("❌ Zap cancelled", buttons=None)
+            await msg.edit(t(sender_id, "zap_cancelled_plain"), buttons=None)
             del pending_zap_confirmations[zap_owner_id]
             return
 
@@ -10446,8 +10237,7 @@ async def process_zap_payment(zap_id, msg, sender_id, receiver_id, amount, amoun
         total_needed = amount + (spark_fee or 0)
         if balance < total_needed:
             await msg.edit(
-                f"❌ **Insufficient balance for network fees**\n\n"
-                f"💡 Deposit a few more sats and retry.",
+                t(sender_id, "zap_insuff_fees"),
                 buttons=None)
             if zap_owner_id in pending_zap_confirmations:
                 del pending_zap_confirmations[zap_owner_id]
@@ -10455,7 +10245,7 @@ async def process_zap_payment(zap_id, msg, sender_id, receiver_id, amount, amoun
 
         # Check if cancelled again before final payment
         if zap_owner_id in pending_zap_confirmations and pending_zap_confirmations[zap_owner_id].get('status') == 'cancelled':
-            await msg.edit("❌ Zap cancelled", buttons=None)
+            await msg.edit(t(sender_id, "zap_cancelled_plain"), buttons=None)
             del pending_zap_confirmations[zap_owner_id]
             return
 
@@ -10473,10 +10263,7 @@ async def process_zap_payment(zap_id, msg, sender_id, receiver_id, amount, amoun
             # If payment succeeded, show success regardless of cancellation status
             # (payment has already gone through at this point)
             await msg.edit(
-                f"✅ **Zap Successful!**\n\n"
-                f"💰 Amount: {amount_display}\n"
-                f"👤 From: {sender_name}\n"
-                f"👤 To: {receiver_name}",
+                t(sender_id, "zap_success", amount=amount_display, sender=sender_name, receiver=receiver_name),
                 buttons=None  # Remove cancel button
             )
             # Tip prompt goes to the SENDER's private chat, never the group
@@ -10484,9 +10271,7 @@ async def process_zap_payment(zap_id, msg, sender_id, receiver_id, amount, amoun
                 await show_tip_prompt(sender_id, chat_id=sender_id)
         else:
             await msg.edit(
-                f"❌ **Zap Failed**\n\n"
-                f"💰 Amount: {amount_display}\n"
-                f"Reason: {failure_reason}",
+                t(sender_id, "zap_failed_block", amount=amount_display, reason=failure_reason),
                 buttons=None
             )
             # Clean up pending zap
@@ -10504,7 +10289,7 @@ async def process_zap_payment(zap_id, msg, sender_id, receiver_id, amount, amoun
 
     except Exception as error:
         logging.error(f"Zap payment error: {error}")
-        error_msg = f"❌ Zap failed: {error}"
+        error_msg = t(sender_id, "zap_failed_reason", reason=error)
 
         # Only edit if not already cancelled
         zap_owner_id = None

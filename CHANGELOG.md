@@ -1,5 +1,19 @@
 # Changelog — Zap Wallet Bot
 
+## v3.3 (2026-11-10)
+
+- Complete Persian (FA) localization: payment summary/success, reports and
+  /zap flow texts translated (owner-sanctioned, texts only — logic untouched);
+  «ساتوشی» adopted as the sats unit term and amount formatters made
+  language-aware (`sats_unit` key)
+- Duplicate-invoice (AlreadyExists) handling made conclusive: the payment
+  gate auto-releases after the unknown-outcome window instead of sticking
+- /zap primary-username mention resolution: multi-username vector with a
+  clickable fallback link
+- P2P admin panel UX pass: attention header, per-case cards, stage badges
+- Python fixes: missed i18n call sites migrated; ffio test pins updated for
+  the i18n migration
+
 ## v3.2.1 (2026-11-09)
 
 - Evidence-gated automatic escrow settlement: a payout/refund trade settles

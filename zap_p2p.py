@@ -397,7 +397,7 @@ TXT = {
   'mark_settled_fee': 'ثبت تسویه کارمزد (نیازمند مدرک)',
   'hold_conflict_title': '\n⚠️ مدارک متناقض:\n{lines}',
   'hold_open_case': '⚖️ پرونده اختلاف',
-  'confirm_fee_text': 'ارسال یک‌باره {fee} سات کارمزد به مالک را تأیید کنید. نتیجه نامعلوم قابل تکرار نیست.',
+  'confirm_fee_text': 'ارسال یک‌باره {fee} ساتوشی کارمزد به مالک را تأیید کنید. نتیجه نامعلوم قابل تکرار نیست.',
   'confirm_fee': 'تأیید ارسال کارمزد', 'confirmation_invalid': 'تأیید نامعتبر یا منقضی است.',
   'legacy_warning': 'معامله قدیمی است. قفل و ارسال‌های قبلی را مستقل بررسی کنید. تأیید ممکن است پول ارسال کند.',
   'legacy_release': 'تأیید پرداخت قدیمی', 'legacy_refund': 'تأیید بازگشت قدیمی',
@@ -409,12 +409,19 @@ TXT = {
   'adm_panel_title': '🛡 پنل ادمین P2P\n\n📊 آمار:',
   'adm_st_trades': '• معاوضه‌ها: {trades} (تموم‌شده: {done})',
   'adm_st_users': '• کاربرای معامله‌کننده: {users}',
-  'adm_st_fees': '• کارمزدهای جمع‌شده: {fees} sats',
+  'adm_st_fees': '• کارمزدهای جمع‌شده: {fees} ساتوشی',
   'adm_st_orders': '• سفارش‌های باز بازار: {orders}',
   'adm_st_disputes': '• اختلاف‌های باز: {disputes}',
   'adm_st_mod': '• بن‌شده‌ها: {banned} · ادمین‌ها: {admins}',
+  'adm_attention_title': '🚨 نیازمند رسیدگی:',
+  'adm_attn_disputes': '⚖️ {n} اختلاف باز',
+  'adm_attn_holds': '🛑 {n} عملیات متوقف',
+  'adm_attn_events': '🔍 {n} رویداد در انتظار بررسی',
   'adm_disputes_btn': '⚖️ اختلاف‌های باز', 'adm_disputes_empty': '✅ اختلاف بازی وجود نداره.',
   'adm_disputes_title': '⚖️ اختلاف‌های باز ({n}):',
+  'adm_dispute_card': '#{id} · {sats} ساتوشی · {price}\n🛒 {buyer} / 💸 {seller} · ⏳ {age}',
+  'adm_loading_case': '⏳ در حال باز کردن پرونده…',
+  'age_mins': '{n} دقیقه', 'age_hours': '{n} ساعت', 'age_days': '{n} روز',
   'adm_ban_btn': '🚫 بن کاربر', 'adm_banlist_btn': '📜 بن‌شده‌ها',
   'adm_banlist_title': '🚫 بن‌شده‌ها ({n}):', 'adm_banlist_empty': '🚫 هیچ‌کی بن نشده.',
   'adm_unban_btn': '♻️ رفع بن {target}', 'adm_unban_notify': '♻️ رفع بن شدی — به بخش P2P خوش برگشتی.',
@@ -440,9 +447,14 @@ TXT = {
   'adm_cx_inflight': '⚠️ قفل در جریانه؛ رسیدگی دستی لازم است.',
   'adm_cx_only_locking': '⚠️ فقط معاوضه‌ی قفل‌نشده از پنل لغو می‌شه؛ پول‌دارها از پرونده‌ی اختلاف.',
   'adm_case_missing': 'پرونده پیدا نشد.',
-  'adm_case_text': '⚖️ پرونده p2p #{id}{auto}\n\n🛒 خریدار: {buyer}\n\n💸 فروشنده: {seller}\n\n💰 {sats} sats (+{fee} کارمزد)\n🏷 {price}\n📌 مرحله: {stage}{reason}',
-  'adm_case_view_text': '⚖️ پرونده #{id}\n\n🛒 خریدار: {buyer}\n💸 فروشنده: {seller}\n\n💰 {sats} sats (+{fee} کارمزد)\n🏷 {price}\n📌 مرحله: {stage}{reason}\n\n{chat}',
-  'adm_auto': '\n⏰ خودکار', 'adm_reason': '\n📝 {reason}', 'adm_stage_locked': 'قفل',
+  'adm_case_text': '⚖️ پرونده p2p #{id}{auto}\n\n🛒 خریدار: {buyer}\n\n💸 فروشنده: {seller}\n\n💰 {sats} ساتوشی (+{fee} کارمزد)\n🏷 {price}\n⏳ سن: {age}\n📌 مرحله: {stage}{reason}',
+  'adm_case_view_text': '⚖️ پرونده #{id}\n\n🛒 خریدار: {buyer}\n💸 فروشنده: {seller}\n\n💰 {sats} ساتوشی (+{fee} کارمزد)\n🏷 {price}\n⏳ سن: {age}\n📌 مرحله: {stage}{reason}\n\n{chat}',
+  'adm_auto': '\n⏰ خودکار', 'adm_reason': '\n📝 {reason}',
+  'adm_stage_locking': 'در حال قفل', 'adm_stage_locked': 'قفل',
+  'adm_stage_fiat': 'اعلام واریز', 'adm_stage_disputed': 'اختلاف',
+  'adm_stage_payout': 'در حال پرداخت', 'adm_stage_refunding': 'در حال بازگشت',
+  'adm_stage_done': 'تمام‌شده', 'adm_stage_refunded': 'برگشت داده شد',
+  'adm_stage_canceled': 'لغو شده', 'adm_stage_invalidated': 'نامعتبر',
   'adm_release_btn': '✅ آزادسازی', 'adm_refund_btn': '↩️ برگشت',
   'adm_chat_btn': '💬 خلاصه چت', 'adm_chat_full_btn': '💬 چت کامل', 'adm_case_back': '« پرونده',
   'adm_chat_title': '📋 چت معاوضه #{id} — {n} پیام اخیر:',
@@ -468,7 +480,7 @@ TXT = {
   'guide_text': '❓ راهنمای معاوضه P2P\n\n📌 می‌خوای بفروشی؟\n1️⃣ «سفارش جدید» رو بزن و مقدار، قیمت و مهلت رو مشخص کن\n2️⃣ خریدار سفارشت رو برداره، ساتوشی + کارمزد ۰.۵٪ رو قفل کن\n3️⃣ خریدار پول رو بهت می‌رسونه و «واریز کردم» می‌زنه\n4️⃣ پول رو که دیدی، «دریافت کردم» بزن — ساتوشی‌ها میرن ولت خریدار\n\n📌 می‌خوای بخری؟\n1️⃣ تو بازار یه سفارش فروش بردار\n2️⃣ فروشنده قفل کرد؟ شماره حسابش رو ازش بگیر و واریز کن\n3️⃣ «واریز کردم» بزن — بعد از تأیید فروشنده، ساتوشی‌ها میاد ولتت\n\n💡 نکته‌ها:\n• تو اتاق معامله می‌تونید بی‌اسم به هم پیام بدید\n• اگه معامله رو نخواستی ادامه بدی، «لغو» دوطرفه می‌شه\n• اختلافی پیش اومد؟ ⚖️ اختلاف رو بزن تا ادمین رسیدگی کنه\n• 💱 ارز معامله (تومان، دلار و…) از ⚙️ تنظیمات ← «ارز مبدا» عوض میشه — نرخ لحظه‌ای هم از همون ارز خونده میشه',
   'wiz_side': 'بیا سفارشت رو بسازیم 👇\n\nمی‌خوای ساتوشی بفروشی یا بخری؟',
   'wiz_amount': '💰 چقدر ساتوشی می‌خوای معاوضه کنی؟\n\nفقط عدد بفرست. مثال: 50000',
-  'wiz_price': '🏷 قیمتت رو چطور می‌فروشی/می‌خری؟\n\nهر واحدی راحته — خودت بنویس.\nمثال:\n• 6500000 تومان\n• 5.3$ برای هر 10k sats',
+  'wiz_price': '🏷 قیمتت رو چطور می‌فروشی/می‌خری؟\n\nهر واحدی راحته — خودت بنویس.\nمثال:\n• 6500000 تومان\n• 5.3$ برای هر 10k ساتوشی',
   'wiz_method': '💳 آخر، توضیحات سفارش — روش پرداخت یا هر نکته‌ای که طرف مقابل باید بدونه (اختیاری).\n\nمثال: «فقط کارت به کارت بانک ملی» — یا خالی بفرست',
   'wiz_bad_amount': '⚠️ این عدد رو نشناستم. لطفاً فقط یه عدد ساتوشی بفرست (مثلاً 50000):',
   'wiz_review': '✍️ سفارشت آماده‌ست. یه نگاه بنداز:',
@@ -492,7 +504,7 @@ TXT = {
   'method_l': '💳 توضیحات',
   'st_locking': '⏳ منتظریم فروشنده ساتوشی‌ها رو قفل کنه…\n\n🔐 ساتوشی‌ها تا آخر معاوضه تو نگه‌داری ربات قفل می‌مونه.\n⏰ اگه فروشنده تا ۳۰ دقیقه قفل نکنه، سفارش خودکار برمی‌گرده بازار.',
   'st_lock_me': 'برای شروع معاوضه، اول ساتوشی‌ها + کارمزد رو قفل کن.\n\n🔒 تا وقتی قفل نشه خریدار کاری نمی‌کنه و معاوضه جلو نمی‌ره.',
-  'lock_sure': '🔒 قراره {amt} sats از ولتت به قفل ربات بره.\n\nاین پول تا آخر معاوضه قفل می‌مونه:\n• معاوضه خوب پیش بره → میره ولت خریدار\n• لغو دوطرفه یا اختلاف → برمی‌گرده ولت تو\n\nمطمئنی؟',
+  'lock_sure': '🔒 قراره {amt} ساتوشی از ولتت به قفل ربات بره.\n\nاین پول تا آخر معاوضه قفل می‌مونه:\n• معاوضه خوب پیش بره → میره ولت خریدار\n• لغو دوطرفه یا اختلاف → برمی‌گرده ولت تو\n\nمطمئنی؟',
   'st_locking_progress': '⏳ دارم ساتوشی‌ها رو قفل می‌کنم… چند لحظه صبر کن.',
   'st_locked': '🔒 ساتوشی‌ها قفل شد!',
   'locked_buyer': '💳 حالا نوبت توئه:\n1️⃣ از فروشنده شماره کارت/حساب رو بگیر (همین‌جا تو چت)\n2️⃣ مبلغ رو با همون روشی که توافق کردید واریز کن\n3️⃣ برگرد و «✅ واریز کردم» رو بزن',
@@ -517,7 +529,7 @@ TXT = {
   'dispute_open': '⚖️ پرونده‌ی اختلافت ثبت شد.\n\nادمین بررسی می‌کنه و تصمیم نهایی رو می‌گیره. تا اون موقع معاوضه ایستاده.',
   'dispute_not_locked': '⚖️ هنوز ساتوشی‌ها قفل نشدن — تا وقتی فروشنده قفل نکرده چیزی برای اختلاف وجود نداره. اگه مشکلی داری، معاوضه رو لغو کن یا با طرف مقابل از طریق چت صحبت کن.',
   'dispute_note': '⚖️ بگو دقیقاً مشکل چیه — توضیحت رو بنویس تا ضمیمه‌ی پرونده بشه:\n\n(اگه نمی‌خوای توضیح بدی، فقط یه چیزی بفرست تا پرونده ثبت شه)',
-  'lock_fail_bal': '⚠️ موجودیت کافی نیست!\n\nبرای این معاوضه باید {need} sats داشته باشی (مقدار سفارش + کارمزد ۰.۵٪).\nاول ولتت رو شارژ کن و دوباره امتحان کن.',
+  'lock_fail_bal': '⚠️ موجودیت کافی نیست!\n\nبرای این معاوضه باید {need} ساتوشی داشته باشی (مقدار سفارش + کارمزد ۰.۵٪).\nاول ولتت رو شارژ کن و دوباره امتحان کن.',
   'lock_fail': '⚠️ قفل کردن انجام نشد: {err}\n\nیه بار دیگه امتحان کن. اگه نشد به ادمین خبر بده.',
   'no_action': '⏳ الان نوبت تو نیست — منتظر بمون تا طرف مقابل کارش رو انجام بده.',
   'active_title': '🔄 معاوضه‌های در جریان',
@@ -549,8 +561,9 @@ TXT = {
   'unit_ask': '📏 می‌خوای چطور مقدار معامله رو مشخص کنی؟',
   'unit_sats': '🪙 ساتوشی',
   'unit_toman': '💵 {fiat}',
+  'unit_sats_word': 'ساتوشی',
   'wiz_sats_amount': '🪙 چند ساتوشی؟\n\nفقط عدد بفرست. مثال: 50000',
-  'fixed_resolved': '✅ ثبت شد: {sats} sats در برابر {fiat} تومان ({prem}%)',
+  'fixed_resolved': '✅ ثبت شد: {sats} ساتوشی در برابر {fiat} تومان ({prem}%)',
   'wiz_sats_price': '🪙 چند ساتوشی می‌خوای در برابر این مبلغ بفروشی؟\n\nفقط عدد بفرست. مثال: 50000',
   'wiz_bad_sats': '⚠️ عدد معتبر نیست. فقط عدد ساتوشی بفرست. مثال: 50000',
   'fiat_hint': '💱 ارز معامله از ⚙️ تنظیمات ← «ارز مبدا» قابل تغییره',
@@ -665,8 +678,15 @@ TXT = {
   'adm_st_orders': '• Open market orders: {orders}',
   'adm_st_disputes': '• Open disputes: {disputes}',
   'adm_st_mod': '• Banned: {banned} · Admins: {admins}',
+  'adm_attention_title': '🚨 Needs attention:',
+  'adm_attn_disputes': '⚖️ {n} open dispute(s)',
+  'adm_attn_holds': '🛑 {n} held operation(s)',
+  'adm_attn_events': '🔍 {n} event(s) awaiting review',
   'adm_disputes_btn': '⚖️ Open disputes', 'adm_disputes_empty': '✅ No open disputes.',
   'adm_disputes_title': '⚖️ Open disputes ({n}):',
+  'adm_dispute_card': '#{id} · {sats} sats · {price}\n🛒 {buyer} / 💸 {seller} · ⏳ {age}',
+  'adm_loading_case': '⏳ Opening case…',
+  'age_mins': '{n}m', 'age_hours': '{n}h', 'age_days': '{n}d',
   'adm_ban_btn': '🚫 Ban user', 'adm_banlist_btn': '📜 Banned',
   'adm_banlist_title': '🚫 Banned ({n}):', 'adm_banlist_empty': '🚫 Nobody is banned.',
   'adm_unban_btn': '♻️ Unban {target}', 'adm_unban_notify': '♻️ You have been unbanned — welcome back to P2P.',
@@ -692,9 +712,14 @@ TXT = {
   'adm_cx_inflight': '⚠️ Lock in progress; manual reconciliation required.',
   'adm_cx_only_locking': '⚠️ Only unlocked trades can be canceled from the panel; funded ones go through the dispute case.',
   'adm_case_missing': 'Case not found.',
-  'adm_case_text': '⚖️ p2p case #{id}{auto}\n\n🛒 Buyer: {buyer}\n\n💸 Seller: {seller}\n\n💰 {sats} sats (+{fee} fee)\n🏷 {price}\n📌 Stage: {stage}{reason}',
-  'adm_case_view_text': '⚖️ Case #{id}\n\n🛒 Buyer: {buyer}\n💸 Seller: {seller}\n\n💰 {sats} sats (+{fee} fee)\n🏷 {price}\n📌 Stage: {stage}{reason}\n\n{chat}',
-  'adm_auto': '\n⏰ automatic', 'adm_reason': '\n📝 {reason}', 'adm_stage_locked': 'locked',
+  'adm_case_text': '⚖️ p2p case #{id}{auto}\n\n🛒 Buyer: {buyer}\n\n💸 Seller: {seller}\n\n💰 {sats} sats (+{fee} fee)\n🏷 {price}\n⏳ Age: {age}\n📌 Stage: {stage}{reason}',
+  'adm_case_view_text': '⚖️ Case #{id}\n\n🛒 Buyer: {buyer}\n💸 Seller: {seller}\n\n💰 {sats} sats (+{fee} fee)\n🏷 {price}\n⏳ Age: {age}\n📌 Stage: {stage}{reason}\n\n{chat}',
+  'adm_auto': '\n⏰ automatic', 'adm_reason': '\n📝 {reason}',
+  'adm_stage_locking': 'locking', 'adm_stage_locked': 'locked',
+  'adm_stage_fiat': 'fiat sent', 'adm_stage_disputed': 'disputed',
+  'adm_stage_payout': 'paying out', 'adm_stage_refunding': 'refunding',
+  'adm_stage_done': 'done', 'adm_stage_refunded': 'refunded',
+  'adm_stage_canceled': 'canceled', 'adm_stage_invalidated': 'invalidated',
   'adm_release_btn': '✅ Release', 'adm_refund_btn': '↩️ Refund',
   'adm_chat_btn': '💬 Chat summary', 'adm_chat_full_btn': '💬 Full chat', 'adm_case_back': '« Case',
   'adm_chat_title': '📋 Trade #{id} chat — {n} recent messages:',
@@ -802,6 +827,7 @@ TXT = {
   'unit_ask': '📏 How do you want to set the amount?',
   'unit_sats': '🪙 Sats',
   'unit_toman': '💵 {fiat}',
+  'unit_sats_word': 'sats',
   'wiz_sats_amount': '🪙 How many sats?\n\nSend just the number. Example: 50000',
   'fixed_resolved': '✅ Set: {sats} sats for {fiat} ({prem}%)',
   'wiz_sats_price': '🪙 How many sats do you want for this amount?\n\nSend just the number. Example: 50000',
@@ -939,6 +965,11 @@ def fee_for(sats):
 
 def side_word(uid, side):
     return T(uid, 'side_sell') if side == 'sell' else T(uid, 'side_buy')
+
+
+def sats_word(uid):
+    """Localized bare unit word for sats amounts (fa: ساتوشی, en: sats)."""
+    return T(uid, 'unit_sats_word')
 
 
 # ==================== escrow wallet ====================
@@ -1699,9 +1730,12 @@ async def _strip_panel(client, uid):
         await _del_pin_note(client, panel[0], panel[1])
 
 
-async def _send_panel(client, uid, text, buttons):
+async def _send_panel(client, uid, text, buttons, parse_mode=None):
     await _strip_panel(client, uid)
-    msg = await client.send_message(uid, text, buttons=buttons)
+    kw = {'buttons': buttons}
+    if parse_mode:
+        kw['parse_mode'] = parse_mode
+    msg = await client.send_message(uid, text, **kw)
     _last_panel[uid] = (msg.chat_id, msg.id)
     # pin the trade room so it stays on top in the user's PV
     # (its «pinned» service note is cleaned up when the panel goes away)
@@ -2428,7 +2462,7 @@ async def wiz_publish(client, uid):
     if w.get('unit') == 'toman' and w.get('fiat_amount') and mode != 'float':
         price_disp = f'{int(w["fiat_amount"]):,} {fw}'
     if mode == 'float' and w.get('unit') == 'sats':
-        price_disp = f'{T(uid, "float_tag")} · {fmt(w["sats"])} sats'
+        price_disp = f'{T(uid, "float_tag")} · {fmt(w["sats"])} {sats_word(uid)}'
     elif mode == 'float':
         prem = w.get('premium') or 0
         price_disp = (f'{int(w.get("fiat_amount") or 0):,} {fw} · '
@@ -2974,14 +3008,14 @@ async def admin_case(client, tid, auto=False):
     seller_un = await username_line(tr['seller'])
     b = _bot()
     for adm in admins:
-        st = T(adm, 'adm_stage_locked') if tr['stage'] in (ST_LOCKED,) else tr['stage']
+        st = stage_label(adm, tr['stage'])
         reason = T(adm, 'adm_reason', reason=_h(tr["dispute_reason"])) if tr.get('dispute_reason') else ''
         auto_line = T(adm, 'adm_auto') if auto else ''
         text = T(adm, 'adm_case_text', id=tid, auto=auto_line,
                  buyer=f'{_h(buyer_un)} · {user_link(tr["buyer"])}',
                  seller=f'{_h(seller_un)} · {user_link(tr["seller"])}',
                  sats=fmt(tr['sats']), fee=fmt(tr['fee']), price=_h(str(tr['price'] or '—')),
-                 stage=_h(st), reason=reason)
+                 stage=_h(st), age=_h(_age_label(adm, tr)), reason=reason)
         buttons = [[_btn(T(adm, 'adm_release_btn'), f'p2p:admrel:{tid}'),
                     _btn(T(adm, 'adm_refund_btn'), f'p2p:admref:{tid}')],
                    [_btn(T(adm, 'adm_chat_btn'), f'p2p:admchat:{tid}')]]
@@ -3233,9 +3267,60 @@ def _hold_conflict_lines(tr, attempt=None):
     return lines
 
 
+_STAGE_LABEL_KEY = {
+    ST_LOCKING: 'adm_stage_locking', ST_LOCKED: 'adm_stage_locked',
+    ST_FIAT: 'adm_stage_fiat', ST_DISPUTED: 'adm_stage_disputed',
+    ST_PAYOUT: 'adm_stage_payout', ST_REFUND: 'adm_stage_refunding',
+    ST_DONE: 'adm_stage_done', ST_REFUNDED: 'adm_stage_refunded',
+    ST_CANCELED: 'adm_stage_canceled', ST_INVALIDATED: 'adm_stage_invalidated',
+}
+
+
+def stage_label(uid, stage):
+    """Localized stage badge for admin listings (raw stage as fallback)."""
+    key = _STAGE_LABEL_KEY.get(stage)
+    return T(uid, key) if key else stage
+
+
+def _age_label(uid, tr):
+    """Rough trade age since its last update, for admin case cards."""
+    ts = tr.get('updated') or tr.get('created')
+    if not ts:
+        return T(uid, 'unknown')
+    secs = max(0, time.time() - ts)
+    if secs < 3600:
+        return T(uid, 'age_mins', n=int(secs // 60))
+    if secs < 86400:
+        return T(uid, 'age_hours', n=int(secs // 3600))
+    return T(uid, 'age_days', n=int(secs // 86400))
+
+
+def _back_row(uid):
+    return [_btn(T(uid, 'admin_back'), 'p2p:adm')]
+
+
+async def _show_panel(client, uid, text, buttons, edit_event=None, parse_mode=None):
+    """Shared tail for admin screens: edit in place or push a pinned panel."""
+    if edit_event is not None:
+        kw = {'buttons': buttons}
+        if parse_mode:
+            kw['parse_mode'] = parse_mode
+        await edit_event.edit(text, **kw)
+    else:
+        await _send_panel(client, uid, text, buttons, parse_mode=parse_mode)
+
+
 async def admin_panel(client, uid, edit_event=None):
     st = p2p_stats()
-    text = (T(uid, 'adm_panel_title') + '\n'
+    attention = []
+    if st['disputes']:
+        attention.append(T(uid, 'adm_attn_disputes', n=st['disputes']))
+    if st['holds']:
+        attention.append(T(uid, 'adm_attn_holds', n=st['holds']))
+    if st['events']:
+        attention.append(T(uid, 'adm_attn_events', n=st['events']))
+    header = (T(uid, 'adm_attention_title') + '\n' + '\n'.join(attention) + '\n\n') if attention else ''
+    text = (header + T(uid, 'adm_panel_title') + '\n'
             + T(uid, 'adm_st_trades', trades=st['trades'], done=st['done']) + '\n'
             + T(uid, 'adm_st_users', users=st['users']) + '\n'
             + T(uid, 'adm_st_fees', fees=fmt(st['fees'])) + '\n'
@@ -3252,30 +3337,28 @@ async def admin_panel(client, uid, edit_event=None):
         [_btn(T(uid, 'adm_admins_btn'), 'p2p:adm:admins')],
         [_btn(T(uid, 'back_p2p'), 'p2p:home')],
     ]
-    if edit_event is not None:
-        await edit_event.edit(text, buttons=buttons)
-    else:
-        await _send_panel(client, uid, text, buttons)
+    await _show_panel(client, uid, text, buttons, edit_event)
 
 
 async def admin_disputes(client, uid, edit_event=None):
     rows = _rows("SELECT * FROM trades WHERE stage='disputed' ORDER BY updated DESC LIMIT 20")
     if not rows:
-        text, buttons = T(uid, 'adm_disputes_empty'), [[_btn(T(uid, 'admin_back'), 'p2p:adm')]]
+        text, buttons = T(uid, 'adm_disputes_empty'), [_back_row(uid)]
     else:
         text = T(uid, 'adm_disputes_title', n=len(rows))
-        buttons = [[_btn(f'#{r["id"]} · {fmt(r["sats"])}s', f'p2p:admcase:{r["id"]}]')] for r in rows]
-        buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
-    if edit_event is not None:
-        await edit_event.edit(text, buttons=buttons)
-    else:
-        await _send_panel(client, uid, text, buttons)
+        for r in rows:
+            text += '\n' + T(uid, 'adm_dispute_card', id=r['id'], sats=fmt(r['sats']),
+                             price=str(r['price'] or '—'), buyer=r['buyer'], seller=r['seller'],
+                             age=_age_label(uid, r))
+        buttons = [[_btn(f'#{r["id"]} · {fmt(r["sats"])} {sats_word(uid)}', f'p2p:admcase:{r["id"]}')] for r in rows]
+        buttons.append(_back_row(uid))
+    await _show_panel(client, uid, text, buttons, edit_event)
 
 
 async def admin_banlist(client, uid, edit_event=None):
     rows = _rows('SELECT * FROM banned ORDER BY at DESC LIMIT 30')
     if not rows:
-        text, buttons = T(uid, 'adm_banlist_empty'), [[_btn(T(uid, 'admin_back'), 'p2p:adm')]]
+        text, buttons = T(uid, 'adm_banlist_empty'), [_back_row(uid)]
     else:
         text = T(uid, 'adm_banlist_title', n=len(rows))
         buttons = []
@@ -3283,11 +3366,8 @@ async def admin_banlist(client, uid, edit_event=None):
             reason = f' — {r["reason"]}' if r['reason'] else ''
             text += f'\n• {r["uid"]}{reason}'
             buttons.append([_btn(T(uid, 'adm_unban_btn', target=r['uid']), f'p2p:adm:unban:{r["uid"]}')])
-        buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
-    if edit_event is not None:
-        await edit_event.edit(text, buttons=buttons)
-    else:
-        await _send_panel(client, uid, text, buttons)
+        buttons.append(_back_row(uid))
+    await _show_panel(client, uid, text, buttons, edit_event)
 
 
 async def admin_admins(client, uid, edit_event=None):
@@ -3300,35 +3380,32 @@ async def admin_admins(client, uid, edit_event=None):
         for i in ids:
             if i != admin_id():
                 buttons.append([_btn(T(uid, 'adm_del_btn', target=i), f'p2p:adm:admdel:{i}')])
-    buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
-    if edit_event is not None:
-        await edit_event.edit(text, buttons=buttons)
-    else:
-        await _send_panel(client, uid, text, buttons)
+    buttons.append(_back_row(uid))
+    await _show_panel(client, uid, text, buttons, edit_event)
 
 
 async def admin_case_view(client, uid, tid, edit_event=None):
     tr = get_trade(tid)
     if not tr:
-        text, buttons = T(uid, 'adm_case_missing'), [[_btn(T(uid, 'admin_back'), 'p2p:adm')]]
+        text, buttons = T(uid, 'adm_case_missing'), [_back_row(uid)]
     else:
-        buyer_un = await username_line(tr['buyer'])
-        seller_un = await username_line(tr['seller'])
+        # two wallet/username lookups run concurrently — the loading toast
+        # on the admcase route covers the wait
+        buyer_un, seller_un = await asyncio.gather(username_line(tr['buyer']),
+                                                   username_line(tr['seller']))
         reason = T(uid, 'adm_reason', reason=_h(tr["dispute_reason"])) if tr.get('dispute_reason') else ''
         text = T(uid, 'adm_case_view_text', id=tid,
                  buyer=f'{_h(buyer_un)} · {user_link(tr["buyer"])}',
                  seller=f'{_h(seller_un)} · {user_link(tr["seller"])}',
                  sats=fmt(tr['sats']), fee=fmt(tr['fee']), price=_h(str(tr['price'] or '—')),
-                 stage=_h(tr['stage']), reason=reason,
+                 stage=_h(stage_label(uid, tr['stage'])), reason=reason,
+                 age=_h(_age_label(uid, tr)),
                  chat=_h(chat_summary(tid, uid=uid)))
         buttons = [[_btn(T(uid, 'adm_release_btn'), f'p2p:admrel:{tid}'),
                     _btn(T(uid, 'adm_refund_btn'), f'p2p:admref:{tid}')],
                    [_btn(T(uid, 'adm_chat_full_btn'), f'p2p:admchat:{tid}'),
                     _btn(T(uid, 'admin_back'), 'p2p:adm')]]
-    if edit_event is not None:
-        await edit_event.edit(text, buttons=buttons, parse_mode='html')
-    else:
-        await _send_panel(client, uid, text, buttons)
+    await _show_panel(client, uid, text, buttons, edit_event, parse_mode='html')
 
 
 def _home_rows(uid):
@@ -3511,7 +3588,7 @@ async def on_callback(client, event, data):
         btns = []
         for tr in rows:
             role = T(uid, 'side_sell') if uid == tr['seller'] else T(uid, 'side_buy')
-            btns.append([_btn(f'#{tr["id"]} · {role} {fmt(tr["sats"])} sats',
+            btns.append([_btn(f'#{tr["id"]} · {role} {fmt(tr["sats"])} {sats_word(uid)}',
                               f'p2p:room:{tr["id"]}')])
         btns.append([_btn(T(uid, 'back_p2p'), 'p2p:home')])
         await event.edit(f'🔄 {T(uid, "active_title")}', buttons=btns)
@@ -3656,7 +3733,7 @@ async def on_callback(client, event, data):
         lines = []
         btns = []
         for o in rows:
-            lines.append(f'#{o["id"]} · {side_word(uid, o["side"])} {fmt(o["sats"])} sats — '
+            lines.append(f'#{o["id"]} · {side_word(uid, o["side"])} {fmt(o["sats"])} {sats_word(uid)} — '
                          f'{T(uid, smap.get(o["status"], "mine_open"))}')
             if o['status'] == 'open':
                 btns.append([_btn(f'{T(uid, "my_cancel")} #{o["id"]}', f'p2p:ocancel:{o["id"]}')])
@@ -3699,7 +3776,7 @@ async def on_callback(client, event, data):
         method = f'\n💳 {T(uid, "method_l")}: {o["method"]}' if o.get('method') else ''
         text = (f'{T(uid, "take_confirm")}\n\n'
                 f'{side_word(uid, o["side"])}\n'
-                f'{T(uid, "amount_l")}: {fmt(o["sats"])} sats\n'
+                f'{T(uid, "amount_l")}: {fmt(o["sats"])} {sats_word(uid)}\n'
                 f'{T(uid, "price_l")}: {o["price"]}{method}\n'
                 f'{maker_stats_line(uid, o["maker"])}')
         await event.edit(text, buttons=[
@@ -3824,10 +3901,10 @@ async def on_callback(client, event, data):
         cursor = max(0, int(data.split(':')[2]))
         rows = _rows(f"SELECT * FROM trades WHERE id>? AND {HOLDS_WHERE} ORDER BY id LIMIT 10", (cursor,))
         total = (_one(f"SELECT COUNT(*) AS c FROM trades WHERE {HOLDS_WHERE}") or {}).get('c') or 0
-        buttons = [[_btn(f'#{r["id"]} · {r["stage"]}', f'p2p:admhold:{r["id"]}')] for r in rows]
+        buttons = [[_btn(f'#{r["id"]} · {stage_label(uid, r["stage"])}', f'p2p:admhold:{r["id"]}')] for r in rows]
         if len(rows) == 10:
             buttons.append([_btn(T(uid, 'next'), f'p2p:admholds:{rows[-1]["id"]}')])
-        buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
+        buttons.append(_back_row(uid))
         await event.edit(f'{T(uid, "holds_panel")} ({total})\n\n{T(uid, "holds_title")}', buttons=buttons)
         return
     if data.startswith('p2p:admhold:'):
@@ -3839,7 +3916,7 @@ async def on_callback(client, event, data):
             await event.edit(T(uid, 'trade_missing')); return
         attempt = _one('SELECT * FROM escrow_fee_attempts WHERE trade_id=?', (tr['id'],))
         unknown = T(uid, 'unknown')
-        text = T(uid, 'hold_detail', id=tr['id'], stage=tr['stage'], buyer=tr['buyer'], seller=tr['seller'], lock=tr['lock_pay_id'] or unknown, payout=tr['payout_id'] or unknown, refund=tr['refund_id'] or unknown, fee=tr['fee'], tries=tr['fee_tries'], fee_id=(attempt or {}).get('payment_id') or unknown)
+        text = T(uid, 'hold_detail', id=tr['id'], stage=stage_label(uid, tr['stage']), buyer=tr['buyer'], seller=tr['seller'], lock=tr['lock_pay_id'] or unknown, payout=tr['payout_id'] or unknown, refund=tr['refund_id'] or unknown, fee=tr['fee'], tries=tr['fee_tries'], fee_id=(attempt or {}).get('payment_id') or unknown)
         # conflict evidence for invalidated / conflicted holds
         conflicts = _hold_conflict_lines(tr, attempt)
         if conflicts:
@@ -3910,7 +3987,7 @@ async def on_callback(client, event, data):
         buttons = [[_btn(f'#{r["id"]} · {r["direction"]} · {r["amount"]}', f'p2p:admevent:{r["id"]}')] for r in rows]
         if len(rows) == 10:
             buttons.append([_btn(T(uid, 'next'), f'p2p:admevents:{rows[-1]["id"]}')])
-        buttons.append([_btn(T(uid, 'admin_back'), 'p2p:adm')])
+        buttons.append(_back_row(uid))
         await event.edit(text, buttons=buttons)
         return
     if data.startswith('p2p:admevent:'):
@@ -3938,7 +4015,8 @@ async def on_callback(client, event, data):
     if data.startswith('p2p:admcase:'):
         if await _admin_gate(event, uid):
             return
-        await event.answer()
+        # loading toast: the case view performs wallet/username lookups
+        await event.answer(T(uid, 'adm_loading_case'))
         await admin_case_view(client, uid, int(data.split(':')[2]), edit_event=event)
         return
     if data.startswith('p2p:admchat:'):
@@ -3986,7 +4064,7 @@ async def on_callback(client, event, data):
         await event.answer()
         _wiz[f'adm:{uid}'] = {'m': 'ban', 'ts': time.time()}
         await event.edit(T(uid, 'adm_ban_prompt'),
-                         buttons=[[_btn(T(uid, 'admin_back'), 'p2p:adm')]])
+                         buttons=[_back_row(uid)])
         return
     if data == 'p2p:adm:banlist':
         if await _admin_gate(event, uid):
@@ -4006,7 +4084,7 @@ async def on_callback(client, event, data):
         await event.answer()
         _wiz[f'adm:{uid}'] = {'m': 'admadd', 'ts': time.time()}
         await event.edit(T(uid, 'adm_add_prompt'),
-                         buttons=[[_btn(T(uid, 'admin_back'), 'p2p:adm')]])
+                         buttons=[_back_row(uid)])
         return
     if data.startswith('p2p:adm:banok:'):
         if await _admin_gate(event, uid):
@@ -4326,7 +4404,7 @@ async def deep_link_take(client, uid, oid):
     method = f'\n{T(uid, "method_l")}: {o["method"]}' if o.get('method') else ''
     text = (f'{T(uid, "take_confirm")}\n\n'
             f'{side_word(uid, o["side"])}\n'
-            f'{T(uid, "amount_l")}: {fmt(o["sats"])} sats\n'
+            f'{T(uid, "amount_l")}: {fmt(o["sats"])} {sats_word(uid)}\n'
             f'{T(uid, "price_l")}: {o["price"]}{method}\n'
             f'{maker_stats_line(uid, o["maker"])}')
     await _send_panel(client, uid, text, buttons=[
